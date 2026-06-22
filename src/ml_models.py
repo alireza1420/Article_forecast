@@ -441,7 +441,7 @@ def plot_feature_importance(
     return {"xgb": xgb_path, "lgb": lgb_path}
 
 
-def merge_rmsle_matrices(baseline_path: Path, ml_path: Path) -> pd.DataFrame:
+def merge_metric_matrices(baseline_path: Path, ml_path: Path) -> pd.DataFrame:
     """Concatenate baseline and ML metric CSVs into a single DataFrame."""
     baseline_df = pd.read_csv(Path(baseline_path), index_col="model")
     ml_df = pd.read_csv(Path(ml_path), index_col="model")
@@ -549,7 +549,7 @@ if __name__ == "__main__":
     for metric, ml_path in metric_paths.items():
         baseline_path = RESULTS_DIR / f"baseline_{metric}.csv"
         if baseline_path.exists():
-            merged = merge_rmsle_matrices(baseline_path, ml_path)
+            merged = merge_metric_matrices(baseline_path, ml_path)
             save_all_models_metric(merged, metric)
             plot_all_models_metric(merged, metric)
             print(f"  all_models_{metric}.csv and plot written ({len(merged)} rows)")
