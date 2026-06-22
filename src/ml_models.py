@@ -19,8 +19,8 @@ import pandas as pd
 import xgboost as xgb
 from sklearn.ensemble import RandomForestRegressor
 
-from src.features import FEATURE_COLS, HORIZON, make_horizon_target  # make_horizon_target added in T006
-from src.baselines import evaluate_all, rmsle, save_predictions  # noqa: F401
+from features import FEATURE_COLS, HORIZON, make_horizon_target  # make_horizon_target added in T006
+from baselines import evaluate_all, rmsle, save_predictions  # noqa: F401
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -442,23 +442,28 @@ def plot_feature_importance(
 
 
 def merge_rmsle_matrices(baseline_path: Path, ml_path: Path) -> pd.DataFrame:
-    """Concatenate baseline_rmsle.csv and ml_rmsle.csv into 8×10 DataFrame."""
+    """Concatenate baseline and ML metric CSVs into a single DataFrame."""
     baseline_df = pd.read_csv(Path(baseline_path), index_col="model")
     ml_df = pd.read_csv(Path(ml_path), index_col="model")
     return pd.concat([baseline_df, ml_df], axis=0)
 
 
-def save_all_models_rmsle(df: pd.DataFrame, results_dir: Path = RESULTS_DIR) -> Path:
-    """Write all_models_rmsle.csv with model index; return path."""
+def save_all_models_metric(df: pd.DataFrame, metric: str, results_dir: Path = RESULTS_DIR) -> Path:
+    """Write all_models_{metric}.csv with model index; return path."""
     results_dir = Path(results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
-    path = results_dir / "all_models_rmsle.csv"
+    path = results_dir / f"all_models_{metric}.csv"
     df.to_csv(path, index=True, index_label="model")
     return path
 
 
-def plot_all_models_comparison(df: pd.DataFrame, figures_dir: Path = FIGURES_DIR) -> Path:
-    """Plot RMSLE vs horizon for all models (8 curves); save all_models_rmsle.pdf."""
+def save_all_models_rmsle(df: pd.DataFrame, results_dir: Path = RESULTS_DIR) -> Path:
+    """Backwards-compatible wrapper around save_all_models_metric for RMSLE."""
+    return save_all_models_metric(df, "rmsle", results_dir)
+
+
+def plot_all_models_metric(df: pd.DataFrame, metric: str, figures_dir: Path = FIGURES_DIR) -> Path:
+    """Plot metric vs horizon for all models; save all_models_{metric}.pdf."""
     figures_dir = Path(figures_dir)
     figures_dir.mkdir(parents=True, exist_ok=True)
     horizons = list(range(1, HORIZON + 1))
@@ -467,30 +472,37 @@ def plot_all_models_comparison(df: pd.DataFrame, figures_dir: Path = FIGURES_DIR
         vals = df.loc[model_name].values.astype(float)
         ax.plot(horizons, vals, marker="o", label=model_name)
     ax.set_xlabel("Horizon")
-    ax.set_ylabel("RMSLE")
+    ax.set_ylabel(metric.upper())
     ax.set_xticks(horizons)
     ax.legend(fontsize=8)
-    ax.set_title("All Models: RMSLE by Horizon")
+    ax.set_title(f"All Models: {metric.upper()} by Horizon")
     plt.tight_layout()
-    path = figures_dir / "all_models_rmsle.pdf"
+    path = figures_dir / f"all_models_{metric}.pdf"
     fig.savefig(path)
     plt.close(fig)
     return path
 
 
-def save_ml_rmsle(
+def plot_all_models_comparison(df: pd.DataFrame, figures_dir: Path = FIGURES_DIR) -> Path:
+    """Backwards-compatible wrapper around plot_all_models_metric for RMSLE."""
+    return plot_all_models_metric(df, "rmsle", figures_dir)
+
+
+def save_ml_metrics(
     models: list,
     fm: pd.DataFrame,
     results_dir: Path = RESULTS_DIR,
-) -> Path:
-    """Evaluate models on fm via evaluate_all; write ml_rmsle.csv; return path."""
+) -> dict[str, Path]:
+    """Evaluate models; write one CSV per metric; return dict of {metric: path}."""
     metrics = evaluate_all(models, fm)
-    rmsle_df = metrics["rmsle"]
     results_dir = Path(results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
-    path = results_dir / "ml_rmsle.csv"
-    rmsle_df.to_csv(path, index=True, index_label="model")
-    return path
+    paths: dict[str, Path] = {}
+    for metric_name, metric_df in metrics.items():
+        path = results_dir / f"{metric_name}_by_model_and_horizon.csv"
+        metric_df.to_csv(path, index=True, index_label="model")
+        paths[metric_name] = path
+    return paths
 
 
 def save_all_predictions(
@@ -508,7 +520,7 @@ def save_all_predictions(
 
 
 if __name__ == "__main__":
-    from src.features import load_feature_matrix
+    from features import load_feature_matrix
 
     print("Loading feature matrix …")
     fm = load_feature_matrix()
@@ -528,17 +540,22 @@ if __name__ == "__main__":
         print(f"  {len(paths)} prediction CSVs written")
 
     print("\nEvaluating all models …")
-    rmsle_path = save_ml_rmsle(models, fm)
-    print(f"  ml_rmsle.csv written: {rmsle_path}")
+    metric_paths = save_ml_metrics(models, fm)
+    for name, p in metric_paths.items():
+        print(f"  {name}_by_model_and_horizon.csv written: {p}")
+    
 
-    baseline_path = RESULTS_DIR / "baseline_rmsle.csv"
-    if baseline_path.exists():
-        merged = merge_rmsle_matrices(baseline_path, rmsle_path)
-        save_all_models_rmsle(merged)
-        plot_all_models_comparison(merged)
-        print(f"  all_models_rmsle.csv and plot written ({len(merged)} rows)")
-    else:
-        print(f"  Skipping merge — {baseline_path} not found")
+
+    for metric, ml_path in metric_paths.items():
+        baseline_path = RESULTS_DIR / f"baseline_{metric}.csv"
+        if baseline_path.exists():
+            merged = merge_rmsle_matrices(baseline_path, ml_path)
+            save_all_models_metric(merged, metric)
+            plot_all_models_metric(merged, metric)
+            print(f"  all_models_{metric}.csv and plot written ({len(merged)} rows)")
+        else:
+            print(f"  Skipping merge for {metric} — {baseline_path} not found")
+    
 
     print("\nPlotting feature importance …")
     xgb_m = next(m for m in models if m.name == "xgboost")

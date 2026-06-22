@@ -174,6 +174,21 @@ def _add_all_features(
 # Public functions
 # ---------------------------------------------------------------------------
 
+def make_horizon_target(fm: pd.DataFrame, h: int) -> pd.DataFrame:
+    """Return feature rows paired with the h-step-ahead log1p target.
+
+    Shifts num_orders forward by h within each (center_id, meal_id) group,
+    applies log1p, and drops rows where the shifted target is NaN.
+    """
+    if h < 1 or h > HORIZON:
+        raise ValueError(f"h must be between 1 and {HORIZON}, got {h}")
+    out = fm.sort_values(["center_id", "meal_id", "week"]).copy()
+    out["y"] = out.groupby(["center_id", "meal_id"])["num_orders"].shift(-h)
+    out = out.dropna(subset=["y"]).copy()
+    out["y"] = np.log1p(out["y"])
+    return out.reset_index(drop=True)
+
+
 def build_feature_matrix(processed_dir: Path = PROCESSED_DIR) -> pd.DataFrame:
     """Assemble tabular feature matrix, drop NaN rows, save parquet; return DataFrame."""
     merged_path = processed_dir / "merged.parquet"
