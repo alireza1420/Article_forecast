@@ -54,6 +54,38 @@ FEATURE_COLS: list[str] = [
     "center_type_enc", "category_enc", "cuisine_enc",
 ]
 
+# DL sequence column sets (additive — FEATURE_COLS not modified)
+SEQUENCE_TEMPORAL_COLS: list[str] = [
+    "num_orders",
+    "checkout_price",
+    "base_price",
+    "discount_rate",
+    "log_checkout_price",
+    "emailer_for_promotion",
+    "homepage_featured",
+    "email_x_discount",
+    "homepage_x_discount",
+    "week_number",
+    "week_of_year_sin",
+    "week_of_year_cos",
+]
+
+SEQUENCE_STATIC_COLS: list[str] = [
+    "center_type_enc",
+    "category_enc",
+    "cuisine_enc",
+    "op_area",
+    "center_mean_orders",
+    "meal_mean_orders",
+]
+
+SPLIT_CONFIG: dict[str, tuple[int, int]] = {
+    "train": (1, TRAIN_MAX_WEEK),
+    "val":   VAL_WEEKS,
+    "cal":   CAL_WEEKS,
+    "eval":  EVAL_WEEKS,
+}
+
 # ---------------------------------------------------------------------------
 # Module-level mutable state (populated by build_* calls or JSON load)
 # ---------------------------------------------------------------------------
@@ -167,6 +199,40 @@ def _add_all_features(
     with open(processed_dir / "encoders.json", "w", encoding="utf-8") as f:
         json.dump(enc_store, f, indent=2)
 
+    return out
+
+
+def _standardise_temporal(
+    df: pd.DataFrame,
+    train_end: int = TRAIN_MAX_WEEK,
+    processed_dir: Path = PROCESSED_DIR,
+) -> pd.DataFrame:
+    """Standardise 11 non-num_orders temporal cols; persist stats; return modified copy."""
+    out = df.copy()
+    cols_to_scale = [c for c in SEQUENCE_TEMPORAL_COLS if c != "num_orders"]
+    train_mask = out["week"] <= train_end
+    sp: dict[str, list] = {}
+    for col in cols_to_scale:
+        col_vals = out.loc[train_mask, col].values
+        col_mean = float(np.nanmean(col_vals))
+        col_std = float(np.nanstd(col_vals, ddof=1))
+        if col_std < 1e-12:
+            col_std = 1.0
+        sp[col] = [col_mean, col_std]
+        out[col] = (out[col] - col_mean) / col_std
+    SCALER_PARAMS.update(sp)
+    processed_dir.mkdir(parents=True, exist_ok=True)
+    sp_path = processed_dir / "scaler_params.json"
+    existing: dict = {}
+    if sp_path.exists():
+        with open(sp_path, encoding="utf-8") as _f:
+            try:
+                existing = json.load(_f)
+            except json.JSONDecodeError:
+                existing = {}
+    existing.update(sp)
+    with open(sp_path, "w", encoding="utf-8") as _f:
+        json.dump(existing, _f, indent=2)
     return out
 
 
@@ -312,6 +378,105 @@ def load_feature_matrix(processed_dir: Path = PROCESSED_DIR) -> pd.DataFrame:
     return pd.read_parquet(path, engine="pyarrow")
 
 
+def build_dl_sequences(
+    df: pd.DataFrame | None = None,
+    processed_dir: Path = PROCESSED_DIR,
+    lookback: int = LOOKBACK,
+    horizons: int = HORIZON,
+    split_config: dict | None = None,
+) -> dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Build and save DL sequence arrays (X_temporal, X_static, y) for all splits."""
+    if split_config is None:
+        split_config = SPLIT_CONFIG
+
+    if df is None:
+        merged_path = processed_dir / "merged.parquet"
+        if not merged_path.exists():
+            raise FileNotFoundError(f"merged.parquet not found at {merged_path}")
+        raw = pd.read_parquet(merged_path, engine="pyarrow")
+        df = _add_all_features(raw, processed_dir=processed_dir)
+
+    all_dl_cols = list(dict.fromkeys(
+        SEQUENCE_TEMPORAL_COLS + SEQUENCE_STATIC_COLS + ["week", "center_id", "meal_id"]
+    ))
+    missing = [c for c in all_dl_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"build_dl_sequences: missing columns in df: {missing}")
+
+    dl_scale_cols = [c for c in SEQUENCE_TEMPORAL_COLS if c != "num_orders"]
+    if not any(c in SCALER_PARAMS for c in dl_scale_cols):
+        df = _standardise_temporal(df, train_end=TRAIN_MAX_WEEK, processed_dir=processed_dir)
+
+    seq_dir = processed_dir / "sequences"
+    seq_dir.mkdir(parents=True, exist_ok=True)
+
+    Xt_lists: dict[str, list] = {s: [] for s in split_config}
+    Xs_lists: dict[str, list] = {s: [] for s in split_config}
+    y_lists: dict[str, list] = {s: [] for s in split_config}
+    meta_lists: dict[str, list] = {s: [] for s in split_config}
+    excluded_count = 0
+
+    for (cid, mid), group in df.groupby(["center_id", "meal_id"], sort=True):
+        group = group.sort_values("week").reset_index(drop=True)
+        week_set = set(int(w) for w in group["week"].values)
+        if len(week_set) < lookback:
+            excluded_count += 1
+            continue
+        week_to_row: dict[int, int] = {int(w): i for i, w in enumerate(group["week"].values)}
+
+        for split_name, (start, end) in split_config.items():
+            is_train = split_name == "train"
+            for W in range(start, end + 1):
+                lb_weeks = list(range(W - lookback, W))
+                tgt_weeks = list(range(W + 1, W + horizons + 1))
+                if not all(w in week_set for w in lb_weeks):
+                    continue
+                if not all(w in week_set for w in tgt_weeks):
+                    continue
+                if is_train and max(tgt_weeks) > TRAIN_MAX_WEEK:
+                    continue
+                if W not in week_set:
+                    continue
+                lb_idx = [week_to_row[w] for w in lb_weeks]
+                tgt_idx = [week_to_row[w] for w in tgt_weeks]
+                X_t = group.iloc[lb_idx][SEQUENCE_TEMPORAL_COLS].to_numpy(dtype=np.float32)
+                X_s = group.iloc[week_to_row[W]][SEQUENCE_STATIC_COLS].to_numpy(dtype=np.float32)
+                y_v = group.iloc[tgt_idx]["num_orders"].to_numpy(dtype=np.float32)
+                Xt_lists[split_name].append(X_t)
+                Xs_lists[split_name].append(X_s)
+                y_lists[split_name].append(y_v)
+                meta_lists[split_name].append([float(cid), float(mid), float(W)])
+
+    result: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    for split_name in split_config:
+        if Xt_lists[split_name]:
+            Xt = np.stack(Xt_lists[split_name], axis=0)
+            Xs = np.stack(Xs_lists[split_name], axis=0)
+            y = np.stack(y_lists[split_name], axis=0)
+        else:
+            Xt = np.empty((0, lookback, len(SEQUENCE_TEMPORAL_COLS)), dtype=np.float32)
+            Xs = np.empty((0, len(SEQUENCE_STATIC_COLS)), dtype=np.float32)
+            y = np.empty((0, horizons), dtype=np.float32)
+
+        for arr_name, arr in [("X_temporal", Xt), ("X_static", Xs), ("y", y)]:
+            if np.isnan(arr).any():
+                raise ValueError(f"NaN detected in {split_name}_{arr_name}")
+
+        np.save(seq_dir / f"{split_name}_X_temporal.npy", Xt)
+        np.save(seq_dir / f"{split_name}_X_static.npy", Xs)
+        np.save(seq_dir / f"{split_name}_y.npy", y)
+
+        if split_name == "eval" and meta_lists[split_name]:
+            meta_arr = np.array(meta_lists[split_name], dtype=np.float32)
+            np.save(seq_dir / "eval_meta.npy", meta_arr)
+
+        print(f"{split_name}: X_temporal={Xt.shape} X_static={Xs.shape} y={y.shape}")
+        result[split_name] = (Xt, Xs, y)
+
+    print(f"Excluded pairs (insufficient history): {excluded_count}")
+    return result
+
+
 def save_feature_table_tex(out_dir: Path = TABLES_DIR) -> Path:
     """Write feature_table.tex booktabs tabular; return path."""
     # Metadata: (type, description, model_scope)
@@ -391,6 +556,11 @@ if __name__ == "__main__":
     splits = build_sequences()
     for name, (X, y) in splits.items():
         print(f"  {name:5s}  X: {X.shape}  y: {y.shape}")
+
+    print("Building DL sequences…")
+    dl_splits = build_dl_sequences()
+    for name, (Xt, Xs, y_dl) in dl_splits.items():
+        print(f"  {name:5s}  X_temporal={Xt.shape}  X_static={Xs.shape}  y={y_dl.shape}")
 
     tex_path = save_feature_table_tex()
     print(f"Saved {tex_path}")
