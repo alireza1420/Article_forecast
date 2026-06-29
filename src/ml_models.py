@@ -17,6 +17,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import xgboost as xgb
+from catboost import CatBoostRegressor
 from sklearn.ensemble import RandomForestRegressor
 
 from features import FEATURE_COLS, HORIZON, make_horizon_target  # make_horizon_target added in T006
@@ -54,6 +55,11 @@ LGB_HPO_GRID: dict = {
     "num_leaves": [63, 127],
 }  # 4 combinations
 
+CAT_HPO_GRID: dict = {
+    "learning_rate": [0.05, 0.1],
+    "depth": [6, 8],
+}  # 4 combinations
+
 # Default hyperparameters (may be overridden by HPO winner)
 XGB_PARAMS: dict = {
     "objective": "reg:squarederror",
@@ -86,6 +92,19 @@ LGB_PARAMS: dict = {
     "n_jobs": -1,
     "random_state": SEED,
     "verbosity": -1,
+}
+
+CAT_PARAMS: dict = {
+    "loss_function": "RMSE",
+    "eval_metric": "RMSE",
+    "iterations": 500,
+    "learning_rate": 0.05,
+    "depth": 6,
+    "random_seed": SEED,
+    "early_stopping_rounds": 50,
+    "thread_count": -1,
+    "allow_writing_files": False,
+    "verbose": False,
 }
 
 
@@ -244,6 +263,7 @@ class RandomForestForecaster(BaseMLForecaster):
         out_dir = Path(models_dir) / "random_forest"
         out_dir.mkdir(parents=True, exist_ok=True)
         for h_idx, model in enumerate(self.models_):
+            
             joblib.dump(model, out_dir / f"rf_h{h_idx + 1:02d}.pkl")
 
     def load(self, models_dir: Path = MODELS_DIR) -> None:
@@ -312,6 +332,66 @@ class LightGBMForecaster(BaseMLForecaster):
         """Load 10 joblib pkl files into self.models_."""
         in_dir = Path(models_dir) / "lightgbm"
         self.models_ = [joblib.load(in_dir / f"lgbm_h{h:02d}.pkl") for h in range(1, HORIZON + 1)]
+
+
+class CatBoostForecaster(BaseMLForecaster):
+    """Direct multi-step CatBoost forecaster; HPO at h=1 reused for h=2..10."""
+
+    name: str = "catboost"
+
+    def fit_all(self, fm: pd.DataFrame) -> None:
+        """Train 10 CatBoostRegressors; HPO at h=1 selects best lr×depth for all horizons."""
+        self.models_ = []
+        best_hpo = run_hpo_catboost(fm, RESULTS_DIR)
+        params = {**CAT_PARAMS, **best_hpo}
+        for h in range(1, HORIZON + 1):
+            hdf = make_horizon_target(fm, h)
+            train_df = hdf[hdf["week"] <= TRAIN_MAX_WEEK]
+            val_df = hdf[(hdf["week"] >= VAL_MIN_WEEK) & (hdf["week"] <= VAL_MAX_WEEK)]
+            X_train = train_df[FEATURE_COLS].values.astype(np.float32)
+            y_train = train_df["y"].values.astype(np.float32)
+            model = CatBoostRegressor(**params)
+            if len(val_df) > 0:
+                X_val = val_df[FEATURE_COLS].values.astype(np.float32)
+                y_val = val_df["y"].values.astype(np.float32)
+                model.fit(X_train, y_train, eval_set=(X_val, y_val))
+            else:
+                model.fit(X_train, y_train)
+            self.models_.append(model)
+
+    def predict_all(self, fm: pd.DataFrame) -> pd.DataFrame:
+        """Predict for all horizons; clip log-space pred to 0 then expm1."""
+        anchors = _anchor_rows(fm)
+        X_anchor = anchors[FEATURE_COLS].values.astype(np.float32)
+        rows = []
+        for h_idx, model in enumerate(self.models_):
+            horizon = h_idx + 1
+            raw = model.predict(X_anchor)
+            y_pred = _postprocess(raw)
+            for i, (_, anc) in enumerate(anchors.iterrows()):
+                rows.append({
+                    "center_id": int(anc["center_id"]),
+                    "meal_id": int(anc["meal_id"]),
+                    "horizon": horizon,
+                    "y_pred": float(y_pred[i]),
+                })
+        return pd.DataFrame(rows)[["center_id", "meal_id", "horizon", "y_pred"]]
+
+    def save(self, models_dir: Path = MODELS_DIR) -> None:
+        """Save each booster as cat_h{h:02d}.cbm in models_dir/catboost/."""
+        out_dir = Path(models_dir) / "catboost"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for h_idx, model in enumerate(self.models_):
+            model.save_model(str(out_dir / f"cat_h{h_idx + 1:02d}.cbm"))
+
+    def load(self, models_dir: Path = MODELS_DIR) -> None:
+        """Load 10 boosters from models_dir/catboost/cat_h*.cbm."""
+        in_dir = Path(models_dir) / "catboost"
+        self.models_ = []
+        for h in range(1, HORIZON + 1):
+            m = CatBoostRegressor()
+            m.load_model(str(in_dir / f"cat_h{h:02d}.cbm"))
+            self.models_.append(m)
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +468,37 @@ def run_hpo_lightgbm(fm: pd.DataFrame, results_dir: Path = RESULTS_DIR) -> dict:
     return {"learning_rate": float(best["learning_rate"]), "num_leaves": int(best["num_leaves"])}
 
 
+def run_hpo_catboost(fm: pd.DataFrame, results_dir: Path = RESULTS_DIR) -> dict:
+    """Run 4-combo HPO grid for CatBoost at h=1; returns best params dict."""
+    hdf = make_horizon_target(fm, h=1)
+    train_df = hdf[hdf["week"] <= TRAIN_MAX_WEEK]
+    val_df = hdf[(hdf["week"] >= VAL_MIN_WEEK) & (hdf["week"] <= VAL_MAX_WEEK)]
+    X_tr, y_tr = train_df[FEATURE_COLS].values, train_df["y"].values
+    X_val, y_val = val_df[FEATURE_COLS].values, val_df["y"].values
+
+    rows = []
+    for lr, depth in itertools.product(CAT_HPO_GRID["learning_rate"], CAT_HPO_GRID["depth"]):
+        params = {**CAT_PARAMS, "learning_rate": lr, "depth": depth}
+        model = CatBoostRegressor(**params)
+        model.fit(X_tr, y_tr, eval_set=(X_val, y_val))
+        preds = np.expm1(np.clip(model.predict(X_val), 0, None))
+        y_true = np.expm1(y_val)
+        val_rmsle = rmsle(y_true, preds)
+        rows.append({"learning_rate": lr, "depth": depth, "val_rmsle_h01": val_rmsle})
+
+    df_hpo = pd.DataFrame(rows)
+    best_idx = df_hpo["val_rmsle_h01"].idxmin()
+    df_hpo["selected"] = False
+    df_hpo.loc[best_idx, "selected"] = True
+
+    results_dir = Path(results_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    df_hpo.to_csv(results_dir / "hpo_catboost.csv", index=False)
+
+    best = df_hpo.loc[best_idx]
+    return {"learning_rate": float(best["learning_rate"]), "depth": int(best["depth"])}
+
+
 def plot_feature_importance(
     xgb_model: XGBoostForecaster,
     lgb_model: LightGBMForecaster,
@@ -439,6 +550,104 @@ def plot_feature_importance(
     plt.close(fig_lgb)
 
     return {"xgb": xgb_path, "lgb": lgb_path}
+
+
+def _pred_actual_joined(model: BaseMLForecaster, fm: pd.DataFrame) -> pd.DataFrame:
+    """Return per-(pair, horizon) predictions inner-joined to actual demand.
+
+    Maps each prediction to its calendar target week (anchor_week + horizon) and
+    joins to actuals on the same (center_id, meal_id, target_week) cells used by
+    evaluate_all, yielding columns: center_id, meal_id, horizon, target_week,
+    y_pred, actual.
+    """
+    preds = model.predict_all(fm)
+    anchor_wks = (
+        fm[fm["week"] <= PRED_CUTOFF]
+        .groupby(["center_id", "meal_id"])["week"]
+        .max()
+        .reset_index()
+        .rename(columns={"week": "anchor_week"})
+    )
+    preds = preds.merge(anchor_wks, on=["center_id", "meal_id"], how="left")
+    preds["target_week"] = preds["anchor_week"] + preds["horizon"]
+    actuals = fm[["center_id", "meal_id", "week", "num_orders"]].rename(
+        columns={"week": "target_week", "num_orders": "actual"}
+    )
+    return preds.merge(actuals, on=["center_id", "meal_id", "target_week"], how="inner")
+
+
+def plot_pred_vs_actual(
+    model: BaseMLForecaster,
+    fm: pd.DataFrame,
+    figures_dir: Path = FIGURES_DIR,
+) -> Path:
+    """Plot total predicted vs actual demand per eval week for one model.
+
+    Aggregates the joined predictions/actuals by target week so both lines cover
+    identical rows. Saves pred_vs_actual_{model.name}.pdf; returns the path.
+    """
+    figures_dir = Path(figures_dir)
+    figures_dir.mkdir(parents=True, exist_ok=True)
+
+    joined = _pred_actual_joined(model, fm)
+    agg = (
+        joined.groupby("target_week")
+        .agg(predicted=("y_pred", "sum"), actual=("actual", "sum"))
+        .reset_index()
+        .sort_values("target_week")
+    )
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(agg["target_week"], agg["actual"], marker="o", label="Actual")
+    ax.plot(agg["target_week"], agg["predicted"], marker="s", linestyle="--", label="Predicted")
+    ax.set_xlabel("Week")
+    ax.set_ylabel("Total demand (num_orders)")
+    ax.set_xticks(agg["target_week"].astype(int).tolist())
+    ax.set_title(f"{model.name}: Predicted vs Actual Demand")
+    ax.legend()
+    plt.tight_layout()
+
+    path = figures_dir / f"pred_vs_actual_{model.name}.pdf"
+    fig.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def plot_pred_vs_actual_scatter(
+    model: BaseMLForecaster,
+    fm: pd.DataFrame,
+    figures_dir: Path = FIGURES_DIR,
+) -> Path:
+    """Scatter of predicted vs actual demand (one point per pair x horizon).
+
+    Plots y=predicted against x=actual with a y=x reference line and the overall
+    RMSLE annotated. Saves pred_vs_actual_scatter_{model.name}.pdf; returns path.
+    """
+    figures_dir = Path(figures_dir)
+    figures_dir.mkdir(parents=True, exist_ok=True)
+
+    joined = _pred_actual_joined(model, fm)
+    y_true = joined["actual"].values.astype(float)
+    y_pred = joined["y_pred"].values.astype(float)
+    score = rmsle(y_true, y_pred)
+    lim = float(max(y_true.max(), y_pred.max())) if len(joined) else 1.0
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+    ax.scatter(y_true, y_pred, s=8, alpha=0.3, edgecolors="none")
+    ax.plot([0, lim], [0, lim], color="red", linestyle="--", linewidth=1, label="y = x")
+    ax.set_xlim(0, lim)
+    ax.set_ylim(0, lim)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("Actual demand (num_orders)")
+    ax.set_ylabel("Predicted demand (num_orders)")
+    ax.set_title(f"{model.name}: Predicted vs Actual (RMSLE = {score:.4f})")
+    ax.legend()
+    plt.tight_layout()
+
+    path = figures_dir / f"pred_vs_actual_scatter_{model.name}.pdf"
+    fig.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    return path
 
 
 def merge_metric_matrices(baseline_path: Path, ml_path: Path) -> pd.DataFrame:
@@ -530,6 +739,7 @@ if __name__ == "__main__":
         XGBoostForecaster(),
         RandomForestForecaster(),
         LightGBMForecaster(),
+        CatBoostForecaster(),
     ]
 
     for m in models:
@@ -563,4 +773,11 @@ if __name__ == "__main__":
     fi_paths = plot_feature_importance(xgb_m, lgb_m)
     print(f"  XGBoost importance PDF: {fi_paths['xgb']}")
     print(f"  LightGBM importance PDF: {fi_paths['lgb']}")
+
+    print("\nPlotting predicted vs actual demand per model …")
+    for m in models:
+        ts_path = plot_pred_vs_actual(m, fm)
+        sc_path = plot_pred_vs_actual_scatter(m, fm)
+        print(f"  {m.name}: {ts_path.name}, {sc_path.name}")
+
     print("\nCycle 4 complete.")
