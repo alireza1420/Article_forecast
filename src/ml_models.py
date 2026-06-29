@@ -737,7 +737,7 @@ if __name__ == "__main__":
 
     models: list[BaseMLForecaster] = [
         XGBoostForecaster(),
-        RandomForestForecaster(),
+        # RandomForestForecaster(),
         LightGBMForecaster(),
         CatBoostForecaster(),
     ]
