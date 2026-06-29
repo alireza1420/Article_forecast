@@ -16,14 +16,21 @@ from torch.utils.data import DataLoader, Dataset
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 SEED: int = 42
-LR: float = 1e-3
+LR: float = 5e-4
 WEIGHT_DECAY: float = 1e-4
 BATCH_SIZE: int = 256
-MAX_EPOCHS: int = 150
+MAX_EPOCHS: int = 300
 MAX_EPOCHS_CPU: int = 50
-PATIENCE: int = 15
-N_TEMPORAL: int = 12
-N_STATIC: int = 6
+PATIENCE: int = 20
+# 32 features: all SEQUENCE_TEMPORAL_COLS (num_orders, prices, promotions, EWMs, rolling stats, calendar, ranks)
+N_TEMPORAL: int = 32
+N_STATIC: int = 21
+PAPER_LOOKBACK: int = 10  # 10-timestep input window
+
+# Architecture knobs (selected empirically; see DemandRNN docstring)
+SKIP_K: int = 3           # last K weeks' full feature snapshots fed directly to the head
+STATIC_FUSE_DIM: int = 64  # width of the static-feature projection concatenated at the head
+HEAD_DROPOUT: float = 0.3
 
 SEQ_DIR: Path = Path("data/processed/sequences")
 MODELS_DIR: Path = Path("results/models/lstm")
@@ -80,28 +87,70 @@ class LSTMArchConfig:
         return cls(**json.loads(s))
 
 
-CONFIG_A: LSTMArchConfig = LSTMArchConfig(
-    lstm_layers=[
-        {"hidden_size": 128, "dropout": 0.2},
-        {"hidden_size": 64, "dropout": 0.1},
-    ],
-    head_layers=[
-        {"type": "relu"},
-        {"type": "dropout", "p": 0.1},
-        {"type": "linear", "out_features": 10},
-    ],
-    bidirectional=False,
-)
+# # Paper-matching architectures (Section IV.B: 32→16 hidden units)
+# CONFIG_A: LSTMArchConfig = LSTMArchConfig(
+#     lstm_layers=[
+#         {"hidden_size": 32, "dropout": 0.25},
+#         {"hidden_size": 16, "dropout": 0.0},
+#     ],
+#     head_layers=[
+#         {"type": "relu"},
+#         {"type": "dropout", "p": 0.1},
+#         {"type": "linear", "out_features": 10},
+#     ],
+#     bidirectional=False,
+# )
 
-CONFIG_B: LSTMArchConfig = LSTMArchConfig(
+# CONFIG_A_BI: LSTMArchConfig = LSTMArchConfig(
+#     lstm_layers=[
+#         {"hidden_size": 32, "dropout": 0.25},
+#         {"hidden_size": 16, "dropout": 0.0},
+#     ],
+#     head_layers=[
+#         {"type": "relu"},
+#         {"type": "dropout", "p": 0.1},
+#         {"type": "linear", "out_features": 10},
+#     ],
+#     bidirectional=True,
+# )
+
+# # Larger ablation variants
+# CONFIG_B: LSTMArchConfig = LSTMArchConfig(
+#     lstm_layers=[
+#         {"hidden_size": 64, "dropout": 0.2},
+#         {"hidden_size": 32, "dropout": 0.1},
+#     ],
+#     head_layers=[
+#         {"type": "relu"},
+#         {"type": "dropout", "p": 0.1},
+#         {"type": "linear", "out_features": 10},
+#     ],
+#     bidirectional=False,
+# )
+
+# CONFIG_B_BI: LSTMArchConfig = LSTMArchConfig(
+#     lstm_layers=[
+#         {"hidden_size": 64, "dropout": 0.2},
+#         {"hidden_size": 32, "dropout": 0.1},
+#     ],
+#     head_layers=[
+#         {"type": "relu"},
+#         {"type": "dropout", "p": 0.1},
+#         {"type": "linear", "out_features": 10},
+#     ],
+#     bidirectional=True,
+# )
+
+CONFIG_C: LSTMArchConfig = LSTMArchConfig(
+    # Uniform stacked LSTM: hidden=128, num_layers=2, recurrent dropout=0.3.
+    # DemandRNN reads hidden/num_layers/dropout from these entries and builds its own
+    # fusion + skip head (head_layers below only declares the output width=10 so the
+    # ablation/validation machinery keeps working).
     lstm_layers=[
-        {"hidden_size": 128, "dropout": 0.2},
-        {"hidden_size": 64, "dropout": 0.15},
-        {"hidden_size": 32, "dropout": 0.0},
+        {"hidden_size": 128, "dropout": 0.3},
+        {"hidden_size": 128, "dropout": 0.3},
     ],
     head_layers=[
-        {"type": "relu"},
-        {"type": "dropout", "p": 0.1},
         {"type": "linear", "out_features": 10},
     ],
     bidirectional=False,
@@ -111,7 +160,24 @@ CONFIG_B: LSTMArchConfig = LSTMArchConfig(
 # ── DemandRNN ─────────────────────────────────────────────────────────────────
 
 class DemandRNN(nn.Module):
-    """Config-driven LSTM with static-feature h_0 initialisation."""
+    """Stacked LSTM + static-level fusion + recent-week skip connection.
+
+    Architecture selected empirically to close the gap with gradient-boosted trees:
+      - a uniform stacked ``nn.LSTM`` encodes the (correctly windowed) demand sequence;
+      - the static vector (per-series level: center/meal mean orders, price & count
+        aggregates) is projected and concatenated to the final hidden state, so the
+        head reads series level directly instead of from a washed-out h_0 seed;
+      - the last ``SKIP_K`` weeks' full feature snapshots are concatenated to the head
+        as a skip connection, giving short-horizon predictions direct access to the
+        most recent observed demand / promotions / prices — the signal trees exploit
+        via explicit lags. This is what makes h=1 a true 1-step forecast usable.
+    Output is ``softplus`` so log1p predictions stay strictly non-negative.
+
+    Hyper-parameters are read from ``config`` for compatibility with the ablation
+    machinery: ``hidden`` and ``num_layers`` come from ``lstm_layers`` (first layer's
+    ``hidden_size`` and the layer count), the recurrent ``dropout`` from the first
+    layer, and the output width from ``head_layers[-1]['out_features']``.
+    """
 
     def __init__(
         self,
@@ -121,78 +187,43 @@ class DemandRNN(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        dir_mult = 2 if config.bidirectional else 1
-        H0 = config.lstm_layers[0]["hidden_size"]
+        hidden = int(config.lstm_layers[0]["hidden_size"])
+        num_layers = len(config.lstm_layers)
+        dropout = float(config.lstm_layers[0].get("dropout", 0.0))
+        out_features = int(config.head_layers[-1]["out_features"])
 
-        self.static_enc = nn.Sequential(
-            nn.Linear(n_static, H0),
-            nn.Tanh(),
+        self.lstm = nn.LSTM(
+            n_temporal, hidden,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
         )
-
-        self.lstm_cells: nn.ModuleList = nn.ModuleList()
-        self.lstm_drops: nn.ModuleList = nn.ModuleList()
-        input_size = n_temporal
-        for layer_cfg in config.lstm_layers:
-            H = layer_cfg["hidden_size"]
-            self.lstm_cells.append(
-                nn.LSTM(
-                    input_size, H,
-                    num_layers=1,
-                    batch_first=True,
-                    bidirectional=config.bidirectional,
-                )
+        self.static_fuse = (
+            nn.Sequential(
+                nn.Linear(n_static, STATIC_FUSE_DIM), nn.ReLU(), nn.Dropout(HEAD_DROPOUT)
             )
-            self.lstm_drops.append(nn.Dropout(p=float(layer_cfg["dropout"])))
-            input_size = H * dir_mult
-
-        H_last = config.lstm_layers[-1]["hidden_size"] * dir_mult
-        current_size = H_last
-        head_modules: list[nn.Module] = []
-        for spec in config.head_layers:
-            t = spec["type"]
-            if t == "relu":
-                head_modules.append(nn.ReLU())
-            elif t == "dropout":
-                head_modules.append(nn.Dropout(p=float(spec["p"])))
-            elif t == "batchnorm":
-                head_modules.append(nn.BatchNorm1d(current_size))
-            elif t == "linear":
-                out_features = spec["out_features"]
-                head_modules.append(nn.Linear(current_size, out_features))
-                current_size = out_features
-            else:
-                raise ValueError(f"Unknown head layer type: {t!r}")
-        self.head = nn.Sequential(*head_modules)
-
-    def encode_static(self, x_static: torch.Tensor) -> torch.Tensor:
-        """Encode static features to h_0 of shape (1 or 2, B, H0)."""
-        h = self.static_enc(x_static).unsqueeze(0)  # (1, B, H0)
-        if self.config.bidirectional:
-            h = h.expand(2, -1, -1).contiguous()    # (2, B, H0), both equal
-        return h
+            if n_static > 0 else None
+        )
+        fuse_dim = STATIC_FUSE_DIM if n_static > 0 else 0
+        head_in = hidden + fuse_dim + n_temporal * SKIP_K
+        self.head = nn.Sequential(
+            nn.Linear(head_in, 128), nn.ReLU(), nn.Dropout(HEAD_DROPOUT),
+            nn.Linear(128, 64), nn.ReLU(), nn.Dropout(HEAD_DROPOUT),
+            nn.Linear(64, out_features),
+        )
 
     def forward(
         self,
         x_temporal: torch.Tensor,
         x_static: torch.Tensor,
     ) -> torch.Tensor:
-        """Forward pass: (B, 26, 12) × (B, 6) → (B, 10)."""
-        B = x_temporal.size(0)
-        device = x_temporal.device
-        dir_mult = 2 if self.config.bidirectional else 1
-
-        out = x_temporal
-        for i, (lstm, drop) in enumerate(zip(self.lstm_cells, self.lstm_drops)):
-            if i == 0:
-                h0 = self.encode_static(x_static)
-            else:
-                H = self.config.lstm_layers[i]["hidden_size"]
-                h0 = torch.zeros(dir_mult, B, H, device=device)
-            c0 = torch.zeros_like(h0)
-            out, _ = lstm(out, (h0, c0))
-            out = drop(out)
-
-        return self.head(out[:, -1, :])
+        """(B, T, N_TEMPORAL), (B, N_STATIC) → (B, out) non-negative log1p predictions."""
+        out, _ = self.lstm(x_temporal)
+        feats = [out[:, -1, :]]
+        if self.static_fuse is not None:
+            feats.append(self.static_fuse(x_static))
+        feats.append(x_temporal[:, -SKIP_K:, :].reshape(x_temporal.size(0), -1))
+        return torch.nn.functional.softplus(self.head(torch.cat(feats, dim=-1)))
 
 
 # ── RMSLELoss ─────────────────────────────────────────────────────────────────
@@ -209,25 +240,30 @@ class RMSLELoss(nn.Module):
 # ── DemandDataset ─────────────────────────────────────────────────────────────
 
 class DemandDataset(Dataset):
-    """Loads {split}_X_temporal.npy, {split}_X_static.npy, {split}_y.npy only."""
+    """Uses all 32 SEQUENCE_TEMPORAL_COLS over the last PAPER_LOOKBACK timesteps."""
 
     def __init__(self, split: str, seq_dir: Path = SEQ_DIR) -> None:
-        """Load arrays; drop NaN rows at init time; log drop count."""
         seq_dir = Path(seq_dir)
-        X_temp = np.load(seq_dir / f"{split}_X_temporal.npy")
-        X_stat = np.load(seq_dir / f"{split}_X_static.npy")
+        X_full = np.load(seq_dir / f"{split}_X_temporal.npy")  # (N, 26, 32)
+        X_stat = np.load(seq_dir / f"{split}_X_static.npy")    # (N, 21)
         y = np.load(seq_dir / f"{split}_y.npy")
 
+        T_seq = X_full.shape[1]
+        positions = np.arange(T_seq - PAPER_LOOKBACK, T_seq)
+
+        # (N, 10, 32) — all temporal features over the lookback window
+        X_new = X_full[:, positions, :].astype(np.float32)
+
         nan_mask = (
-            np.isnan(X_temp).any(axis=(1, 2)) | np.isnan(X_stat).any(axis=1)
+            np.isnan(X_new).any(axis=(1, 2)) | np.isnan(X_stat).any(axis=1)
         )
         n_dropped = int(nan_mask.sum())
         if n_dropped:
             print(f"[DemandDataset] {split}: dropped {n_dropped} NaN rows")
 
         keep = ~nan_mask
-        self.X_temp = torch.tensor(X_temp[keep], dtype=torch.float32)
-        self.X_stat = torch.tensor(X_stat[keep], dtype=torch.float32)
+        self.X_temp = torch.tensor(X_new[keep], dtype=torch.float32)
+        self.X_stat = torch.tensor(X_stat[keep].astype(np.float32), dtype=torch.float32)
         self.y = torch.tensor(y[keep], dtype=torch.float32)
 
     def __len__(self) -> int:
@@ -242,7 +278,7 @@ class DemandDataset(Dataset):
 # ── build_model ───────────────────────────────────────────────────────────────
 
 def build_model(config: LSTMArchConfig) -> DemandRNN:
-    """Instantiate DemandRNN with N_TEMPORAL=12, N_STATIC=6."""
+    """Instantiate DemandRNN with N_TEMPORAL=32, N_STATIC=21."""
     return DemandRNN(N_TEMPORAL, N_STATIC, config)
 
 
@@ -273,13 +309,16 @@ def train(
     set_seed(SEED)
     train_ds = DemandDataset("train", seq_dir=seq_dir)
     val_ds = DemandDataset("val", seq_dir=seq_dir)
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, pin_memory=True)
 
     model = build_model(config).to(device)
-    criterion = RMSLELoss().to(device)
+    criterion = nn.MSELoss()
     optimiser = torch.optim.Adam(
         model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimiser, mode="min", factor=0.5, patience=10, min_lr=1e-6
     )
 
     best_val_rmsle = float("inf")
@@ -288,6 +327,14 @@ def train(
     train_losses: list[float] = []
     val_rmsles: list[float] = []
     last_epoch = 0
+
+    LOG_EVERY = 10  # print a summary line every N epochs
+
+    print(
+        f"[train] {config_name} | device={device} | "
+        f"epochs={max_epochs} | patience={patience} | "
+        f"train_samples={len(train_ds)} | val_samples={len(val_ds)}"
+    )
 
     for epoch in range(max_epochs):
         last_epoch = epoch
@@ -298,6 +345,7 @@ def train(
             optimiser.zero_grad()
             loss = criterion(model(xt, xs), yb)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimiser.step()
             epoch_loss += float(loss.item()) * len(yb)
         train_losses.append(epoch_loss / max(len(train_ds), 1))
@@ -310,12 +358,14 @@ def train(
                 targets.append(yb.numpy())
         y_pred = np.concatenate(preds)
         y_true = np.concatenate(targets)
-        val_rmsle = float(np.sqrt(np.mean(
-            (np.log1p(np.clip(y_pred, 0, None)) - np.log1p(y_true)) ** 2
-        )))
+        val_rmsle = float(np.sqrt(np.mean((y_pred - y_true) ** 2)))
         val_rmsles.append(val_rmsle)
+        scheduler.step(val_rmsle)
 
-        if val_rmsle < best_val_rmsle:
+        current_lr = optimiser.param_groups[0]["lr"]
+        is_best = val_rmsle < best_val_rmsle
+
+        if is_best:
             best_val_rmsle = val_rmsle
             best_epoch = epoch
             patience_counter = 0
@@ -330,8 +380,20 @@ def train(
             )
         else:
             patience_counter += 1
-            if patience_counter >= patience:
-                break
+
+        if (epoch + 1) % LOG_EVERY == 0 or is_best or patience_counter >= patience:
+            tag = " *best*" if is_best else f" patience={patience_counter}/{patience}"
+            print(
+                f"  epoch {epoch + 1:>4}/{max_epochs} | "
+                f"train_loss={train_losses[-1]:.4f} | "
+                f"val_rmsle={val_rmsle:.4f} | "
+                f"lr={current_lr:.2e}"
+                f"{tag}"
+            )
+
+        if patience_counter >= patience:
+            print(f"[train] {config_name} | early stop at epoch {epoch + 1}")
+            break
 
     return {
         "best_val_rmsle": best_val_rmsle,
@@ -350,12 +412,18 @@ def run_ablation(
     models_dir: Path = MODELS_DIR,
 ) -> str:
     """Train Config A and Config B; return name of the best config."""
-    from evaluate import append_experiment_log  # avoid import cycle at module load
+    from evaluate import append_experiment_log, plot_training_curves, plot_lstm_config_predictions  # avoid import cycle at module load
 
     models_dir = Path(models_dir)
     log_path = Path("results/tables/lstm_arch_experiments.csv")
 
-    configs = [("config_a", CONFIG_A), ("config_b", CONFIG_B)]
+    configs = [
+        # ("config_a",    CONFIG_A),
+        # ("config_b",    CONFIG_B),
+        ("config_c",    CONFIG_C),
+        # ("config_a_bi", CONFIG_A_BI),
+        # ("config_b_bi", CONFIG_B_BI),
+    ]
     states: dict[str, dict] = {}
 
     for name, cfg in configs:
@@ -376,6 +444,17 @@ def run_ablation(
     dst_ckpt = models_dir / "lstm_final.pt"
     shutil.copy2(src_ckpt, dst_ckpt)
     print(f"[run_ablation] Final checkpoint saved: {dst_ckpt}")
+
+    best_state = states[best_name]
+    plot_training_curves(
+        best_state["train_losses"],
+        best_state["val_rmsles"],
+        best_state["early_stop_epoch"],
+        Path("results/figures/lstm_training_curves.pdf"),
+    )
+    print("[run_ablation] Training curves saved: results/figures/lstm_training_curves.pdf")
+
+    plot_lstm_config_predictions(configs, models_dir=models_dir)
 
     return best_name
 

@@ -133,8 +133,12 @@ def evaluate_lstm(
             preds.append(model(xt.to(device), xs.to(device)).cpu().numpy())
             targets.append(yb.numpy())
 
-    y_pred = np.concatenate(preds)
-    y_true = np.concatenate(targets)
+    y_pred_log = np.concatenate(preds)
+    y_true_log = np.concatenate(targets)
+
+    # Model outputs log1p(orders); de-transform to raw scale for metrics
+    y_pred = np.expm1(np.clip(y_pred_log, 0, None))
+    y_true = np.expm1(y_true_log)
 
     mape_vals, n_excluded = compute_mape(y_true, y_pred)
     results = {
@@ -221,7 +225,7 @@ def plot_lstm_vs_ml(
         return
 
     df_rmsle = pd.read_csv(rmsle_path, index_col="model")
-    ml_candidates = [m for m in ("xgboost", "lightgbm") if m in df_rmsle.index]
+    ml_candidates = [m for m in ("xgboost", "lightgbm", "random_forest") if m in df_rmsle.index]
     best_ml = df_rmsle.loc[ml_candidates, "h01"].idxmin()
 
     col_names = [f"h{h:02d}" for h in range(1, 11)]
@@ -312,6 +316,9 @@ def plot_all_models_comparison(
             vals = df.loc[model, col_names].to_numpy(dtype=float)
             if model == "lstm":
                 ax.plot(horizons, vals, marker="o", linewidth=2.5, label="lstm", zorder=5)
+            elif model == "lstm_ims":
+                ax.plot(horizons, vals, marker="^", linewidth=2.5, linestyle="-.",
+                        label="lstm_ims", zorder=4)
             elif model in ml_models:
                 ax.plot(horizons, vals, marker="s", linestyle="--", linewidth=1.5, label=model)
             else:
@@ -329,11 +336,114 @@ def plot_all_models_comparison(
         print(f"[plot_all_models_comparison] Saved {out}")
 
 
+# ── plot_lstm_config_predictions ─────────────────────────────────────────────
+
+def plot_lstm_config_predictions(
+    configs: list[tuple[str, "LSTMArchConfig"]],
+    models_dir: Path = Path("results/models/lstm"),
+    seq_dir: Path = SEQ_DIR,
+    figures_dir: Path = FIGURES_DIR,
+) -> None:
+    """For each trained LSTM config, compare predicted vs actual on the eval split.
+
+    Produces two PDFs:
+      lstm_config_pred_vs_actual.pdf   — mean predicted vs actual across horizons
+      lstm_config_rmsle_by_horizon.pdf — RMSLE per config per horizon (grouped bars)
+    """
+    import torch
+    from torch.utils.data import DataLoader
+    from lstm_model import DemandDataset, build_model
+
+    figures_dir = Path(figures_dir)
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    models_dir = Path(models_dir)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    eval_ds = DemandDataset("eval", seq_dir=seq_dir)
+    loader = DataLoader(eval_ds, batch_size=256, shuffle=False)
+
+    # Ground truth (log1p scale in sequences → raw demand after expm1)
+    targets: list[np.ndarray] = []
+    with torch.no_grad():
+        for _, _, yb in loader:
+            targets.append(yb.numpy())
+    y_true = np.expm1(np.concatenate(targets))  # (N, 10), raw orders
+
+    horizons = list(range(1, 11))
+    config_preds: dict[str, np.ndarray] = {}
+
+    for name, cfg in configs:
+        ckpt_path = models_dir / f"best_{name}.pt"
+        if not ckpt_path.exists():
+            print(f"[plot_lstm_config_predictions] {ckpt_path} not found; skipping {name}")
+            continue
+        model = build_model(cfg).to(device)
+        ckpt = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(ckpt["state_dict"])
+        model.eval()
+        preds: list[np.ndarray] = []
+        with torch.no_grad():
+            for xt, xs, _ in loader:
+                preds.append(model(xt.to(device), xs.to(device)).cpu().numpy())
+        config_preds[name] = np.expm1(np.clip(np.concatenate(preds), 0, None))
+
+    if not config_preds:
+        print("[plot_lstm_config_predictions] No checkpoints found; skipping figures")
+        return
+
+    # ── Figure 1: mean predicted vs actual per horizon ─────────────────────────
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(
+        horizons, y_true.mean(axis=0),
+        color="black", linewidth=2.5, marker="o", label="Actual", zorder=10,
+    )
+    for name, y_pred in config_preds.items():
+        ax.plot(horizons, y_pred.mean(axis=0), marker="s", linestyle="--",
+                linewidth=1.5, label=name)
+    ax.set_xlabel("Horizon (h)")
+    ax.set_ylabel("Mean Demand (orders)")
+    ax.set_title("LSTM Configs — Mean Predicted vs Actual (Eval Split)")
+    ax.set_xticks(horizons)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    out1 = figures_dir / "lstm_config_pred_vs_actual.pdf"
+    fig.savefig(out1, format="pdf")
+    plt.close(fig)
+    print(f"[plot_lstm_config_predictions] Saved {out1}")
+
+    # ── Figure 2: RMSLE by horizon per config (grouped bars) ──────────────────
+    n_configs = len(config_preds)
+    width = 0.8 / n_configs
+    x = np.array(horizons, dtype=float)
+
+    fig, ax = plt.subplots(figsize=(11, 5))
+    for i, (name, y_pred) in enumerate(config_preds.items()):
+        rmsle_vals = compute_rmsle(y_true, y_pred)
+        offset = (i - n_configs / 2 + 0.5) * width
+        ax.bar(x + offset, rmsle_vals, width=width, label=name)
+    ax.set_xlabel("Horizon (h)")
+    ax.set_ylabel("RMSLE")
+    ax.set_title("LSTM Configs — RMSLE by Horizon (Eval Split)")
+    ax.set_xticks(horizons)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    out2 = figures_dir / "lstm_config_rmsle_by_horizon.pdf"
+    fig.savefig(out2, format="pdf")
+    plt.close(fig)
+    print(f"[plot_lstm_config_predictions] Saved {out2}")
+
+
 # ── __main__ ──────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     from pathlib import Path
-    from lstm_model import CONFIG_A, LSTMArchConfig
+    from lstm_model import (
+        # CONFIG_A, CONFIG_B,
+          CONFIG_C, 
+        #   CONFIG_A_BI, CONFIG_B_BI, 
+        LSTMArchConfig,
+    )
 
     log_path = TABLES_DIR / "lstm_arch_experiments.csv"
     if log_path.exists():
@@ -354,4 +464,13 @@ if __name__ == "__main__":
     merge_lstm_metrics(results)
     plot_all_models_comparison()
     plot_lstm_vs_ml(results)
+
+    all_configs = [
+        # ("config_a",    CONFIG_A),
+        # ("config_b",    CONFIG_B),
+        ("config_c",    CONFIG_C),
+        # ("config_a_bi", CONFIG_A_BI),
+        # ("config_b_bi", CONFIG_B_BI),
+    ]
+    plot_lstm_config_predictions(all_configs)
     print("Figures saved to results/figures/")

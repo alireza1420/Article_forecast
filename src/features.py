@@ -19,9 +19,9 @@ TABLES_DIR: Path = _ROOT / "results" / "tables"
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-TRAIN_MAX_WEEK: int = 105
-VAL_WEEKS: tuple[int, int] = (106, 115)
-CAL_WEEKS: tuple[int, int] = (116, 125)
+TRAIN_MAX_WEEK: int = 115
+VAL_WEEKS: tuple[int, int] = (116, 125)
+CAL_WEEKS: tuple[int, int] = (116, 125)  # same as VAL; kept for compatibility
 EVAL_WEEKS: tuple[int, int] = (126, 145)
 LOOKBACK: int = 26
 HORIZON: int = 10
@@ -38,7 +38,7 @@ FEATURE_COLS: list[str] = [
     # Rolling 8-week
     "rolling_mean_8w", "rolling_std_8w", "rolling_min_8w", "rolling_max_8w",
     # EWM
-    "ewm_span10", "ewm_span13", "ewm_span26",
+    "ewm_span10", "ewm_span13", "ewm_span26", "ewm_alpha05",
     # Price
     "discount_rate", "log_checkout_price",
     # Promotion
@@ -52,6 +52,20 @@ FEATURE_COLS: list[str] = [
     "meal_mean_orders", "meal_std_orders",
     # Categorical (encoded)
     "center_type_enc", "category_enc", "cuisine_enc",
+    # Base-price aggregates per meal (train only)
+    "base_price_max", "base_price_mean", "base_price_min",
+    # Checkout-price aggregates per meal (train only)
+    "meal_price_max", "meal_price_mean", "meal_price_min",
+    # Count aggregates (train only)
+    "meal_count", "center_cat_count", "center_cui_count", "region_meal_count",
+    # Static price ranks (train only)
+    "center_price_rank", "center_cat_price_rank",
+    "meal_city_price_rank", "meal_price_rank", "meal_region_price_rank",
+    # Time-varying weekly counts
+    "center_week_count", "center_cat_week_count", "city_meal_week_count",
+    "meal_week_count", "region_meal_week_count", "type_meal_week_count",
+    # Time-varying price ranks
+    "center_week_price_rank", "meal_week_price_rank",
 ]
 
 # DL sequence column sets (additive — FEATURE_COLS not modified)
@@ -68,6 +82,24 @@ SEQUENCE_TEMPORAL_COLS: list[str] = [
     "week_number",
     "week_of_year_sin",
     "week_of_year_cos",
+    # Time-varying weekly counts
+    "center_week_count",
+    "center_cat_week_count",
+    "city_meal_week_count",
+    "meal_week_count",
+    "region_meal_week_count",
+    "type_meal_week_count",
+    # Time-varying price ranks
+    "center_week_price_rank",
+    "meal_week_price_rank",
+    # EWM features (α=0.5 per paper; span variants for multi-scale smoothing)
+    "ewm_alpha05",
+    "ewm_span10",
+    "ewm_span13",
+    "ewm_span26",
+    # Rolling statistics (4-week and 8-week windows)
+    "rolling_mean_4w", "rolling_std_4w", "rolling_min_4w", "rolling_max_4w",
+    "rolling_mean_8w", "rolling_std_8w", "rolling_min_8w", "rolling_max_8w",
 ]
 
 SEQUENCE_STATIC_COLS: list[str] = [
@@ -77,6 +109,40 @@ SEQUENCE_STATIC_COLS: list[str] = [
     "op_area",
     "center_mean_orders",
     "meal_mean_orders",
+    # Base-price aggregates per meal
+    "base_price_max", "base_price_mean", "base_price_min",
+    # Checkout-price aggregates per meal
+    "meal_price_max", "meal_price_mean", "meal_price_min",
+    # Count aggregates
+    "meal_count", "center_cat_count", "center_cui_count", "region_meal_count",
+    # Static price ranks
+    "center_price_rank", "center_cat_price_rank",
+    "meal_city_price_rank", "meal_price_rank", "meal_region_price_rank",
+]
+
+# Demand-derived temporal columns that must be log1p-transformed before standardisation.
+# Raw demand is right-skewed (max ~13 000 orders) which, after z-score scaling, produces
+# values up to 33 std devs — saturating LSTM tanh/sigmoid gates and causing systematic
+# underprediction. log1p compresses the scale to match the log1p target (y = log1p(orders)).
+SEQUENCE_LOG1P_COLS: set[str] = {
+    "num_orders",
+    "ewm_alpha05", "ewm_span10", "ewm_span13", "ewm_span26",
+    "rolling_mean_4w", "rolling_std_4w", "rolling_min_4w", "rolling_max_4w",
+    "rolling_mean_8w", "rolling_std_8w", "rolling_min_8w", "rolling_max_8w",
+    "center_week_count", "center_cat_week_count", "city_meal_week_count",
+    "meal_week_count", "region_meal_week_count", "type_meal_week_count",
+}
+
+SEQUENCE_STATIC_CONTINUOUS_COLS: list[str] = [
+    "op_area",
+    "center_mean_orders",
+    "meal_mean_orders",
+    # New continuous static features
+    "base_price_max", "base_price_mean", "base_price_min",
+    "meal_price_max", "meal_price_mean", "meal_price_min",
+    "meal_count", "center_cat_count", "center_cui_count", "region_meal_count",
+    "center_price_rank", "center_cat_price_rank",
+    "meal_city_price_rank", "meal_price_rank", "meal_region_price_rank",
 ]
 
 SPLIT_CONFIG: dict[str, tuple[int, int]] = {
@@ -143,6 +209,9 @@ def _add_all_features(
         out[f"ewm_span{span}"] = grp["num_orders"].transform(
             lambda s, _sp=span: s.ewm(span=_sp, adjust=False).mean()
         )
+    out["ewm_alpha05"] = grp["num_orders"].transform(
+        lambda s: s.ewm(alpha=0.5, adjust=False).mean()
+    )
 
     # --- US4: Price features ---
     out["discount_rate"] = np.where(
@@ -199,6 +268,107 @@ def _add_all_features(
     with open(processed_dir / "encoders.json", "w", encoding="utf-8") as f:
         json.dump(enc_store, f, indent=2)
 
+    # --- US10: Base-price aggregates per meal (train only) ---
+    train_mask = out["week"] <= TRAIN_MAX_WEEK
+    meal_bp = (
+        out[train_mask].groupby("meal_id")["base_price"]
+        .agg(base_price_max="max", base_price_mean="mean", base_price_min="min")
+        .reset_index()
+    )
+    out = out.merge(meal_bp, on="meal_id", how="left")
+
+    # --- US11: Checkout-price aggregates per meal (train only) ---
+    meal_cp = (
+        out[train_mask].groupby("meal_id")["checkout_price"]
+        .agg(meal_price_max="max", meal_price_mean="mean", meal_price_min="min")
+        .reset_index()
+    )
+    out = out.merge(meal_cp, on="meal_id", how="left")
+
+    # --- US12: Count aggregates (train only) ---
+    meal_cnt = (
+        out[train_mask].groupby("meal_id")["num_orders"]
+        .sum().rename("meal_count").reset_index()
+    )
+    out = out.merge(meal_cnt, on="meal_id", how="left")
+
+    center_cat_cnt = (
+        out[train_mask].groupby(["center_id", "category"])["num_orders"]
+        .sum().rename("center_cat_count").reset_index()
+    )
+    out = out.merge(center_cat_cnt, on=["center_id", "category"], how="left")
+
+    center_cui_cnt = (
+        out[train_mask].groupby(["center_id", "cuisine"])["num_orders"]
+        .sum().rename("center_cui_count").reset_index()
+    )
+    out = out.merge(center_cui_cnt, on=["center_id", "cuisine"], how="left")
+
+    region_meal_cnt = (
+        out[train_mask].groupby(["region_code", "meal_id"])["num_orders"]
+        .sum().rename("region_meal_count").reset_index()
+    )
+    out = out.merge(region_meal_cnt, on=["region_code", "meal_id"], how="left")
+
+    # --- US13: Static price ranks (train only) ---
+    _mp = (
+        out[train_mask].groupby(["center_id", "meal_id"])["checkout_price"]
+        .mean().reset_index(name="_p")
+    )
+    _mp["center_price_rank"] = _mp.groupby("center_id")["_p"].rank(method="dense")
+    out = out.merge(_mp[["center_id", "meal_id", "center_price_rank"]], on=["center_id", "meal_id"], how="left")
+
+    _cp = (
+        out[train_mask].groupby(["center_id", "category"])["checkout_price"]
+        .mean().reset_index(name="_p")
+    )
+    _cp["center_cat_price_rank"] = _cp.groupby("center_id")["_p"].rank(method="dense")
+    out = out.merge(_cp[["center_id", "category", "center_cat_price_rank"]], on=["center_id", "category"], how="left")
+
+    _cityp = (
+        out[train_mask].groupby(["city_code", "meal_id"])["checkout_price"]
+        .mean().reset_index(name="_p")
+    )
+    _cityp["meal_city_price_rank"] = _cityp.groupby("city_code")["_p"].rank(method="dense")
+    out = out.merge(_cityp[["city_code", "meal_id", "meal_city_price_rank"]], on=["city_code", "meal_id"], how="left")
+
+    _gp = (
+        out[train_mask].groupby("meal_id")["checkout_price"]
+        .mean().reset_index(name="_p")
+    )
+    _gp["meal_price_rank"] = _gp["_p"].rank(method="dense")
+    out = out.merge(_gp[["meal_id", "meal_price_rank"]], on="meal_id", how="left")
+
+    _rp = (
+        out[train_mask].groupby(["region_code", "meal_id"])["checkout_price"]
+        .mean().reset_index(name="_p")
+    )
+    _rp["meal_region_price_rank"] = _rp.groupby("region_code")["_p"].rank(method="dense")
+    out = out.merge(_rp[["region_code", "meal_id", "meal_region_price_rank"]], on=["region_code", "meal_id"], how="left")
+
+    # --- US14: Time-varying weekly counts (all weeks — current week is always known) ---
+    cwc = out.groupby(["center_id", "week"])["num_orders"].sum().rename("center_week_count").reset_index()
+    out = out.merge(cwc, on=["center_id", "week"], how="left")
+
+    ccwc = out.groupby(["center_id", "category", "week"])["num_orders"].sum().rename("center_cat_week_count").reset_index()
+    out = out.merge(ccwc, on=["center_id", "category", "week"], how="left")
+
+    cmwc = out.groupby(["city_code", "meal_id", "week"])["num_orders"].sum().rename("city_meal_week_count").reset_index()
+    out = out.merge(cmwc, on=["city_code", "meal_id", "week"], how="left")
+
+    mwc = out.groupby(["meal_id", "week"])["num_orders"].sum().rename("meal_week_count").reset_index()
+    out = out.merge(mwc, on=["meal_id", "week"], how="left")
+
+    rmwc = out.groupby(["region_code", "meal_id", "week"])["num_orders"].sum().rename("region_meal_week_count").reset_index()
+    out = out.merge(rmwc, on=["region_code", "meal_id", "week"], how="left")
+
+    tmwc = out.groupby(["center_type", "meal_id", "week"])["num_orders"].sum().rename("type_meal_week_count").reset_index()
+    out = out.merge(tmwc, on=["center_type", "meal_id", "week"], how="left")
+
+    # --- US15: Time-varying price ranks (all weeks) ---
+    out["center_week_price_rank"] = out.groupby(["center_id", "week"])["checkout_price"].rank(method="dense")
+    out["meal_week_price_rank"] = out.groupby(["meal_id", "week"])["checkout_price"].rank(method="dense")
+
     return out
 
 
@@ -207,12 +377,19 @@ def _standardise_temporal(
     train_end: int = TRAIN_MAX_WEEK,
     processed_dir: Path = PROCESSED_DIR,
 ) -> pd.DataFrame:
-    """Standardise 11 non-num_orders temporal cols; persist stats; return modified copy."""
+    """log1p-transform demand cols, then z-score standardise all temporal cols; persist stats."""
     out = df.copy()
-    cols_to_scale = [c for c in SEQUENCE_TEMPORAL_COLS if c != "num_orders"]
+
+    # Apply log1p to demand-derived columns before standardising so that right-skewed
+    # demand values (max ~13 000 raw orders → up to 33 std devs after plain z-score)
+    # are compressed to a range that won't saturate LSTM tanh/sigmoid gates.
+    for col in SEQUENCE_LOG1P_COLS:
+        if col in out.columns:
+            out[col] = np.log1p(np.clip(out[col], 0.0, None))
+
     train_mask = out["week"] <= train_end
     sp: dict[str, list] = {}
-    for col in cols_to_scale:
+    for col in SEQUENCE_TEMPORAL_COLS:
         col_vals = out.loc[train_mask, col].values
         col_mean = float(np.nanmean(col_vals))
         col_std = float(np.nanstd(col_vals, ddof=1))
@@ -222,6 +399,40 @@ def _standardise_temporal(
         out[col] = (out[col] - col_mean) / col_std
     SCALER_PARAMS.update(sp)
     processed_dir.mkdir(parents=True, exist_ok=True)
+    sp_path = processed_dir / "scaler_params.json"
+    existing: dict = {}
+    if sp_path.exists():
+        with open(sp_path, encoding="utf-8") as _f:
+            try:
+                existing = json.load(_f)
+            except json.JSONDecodeError:
+                existing = {}
+    existing.update(sp)
+    with open(sp_path, "w", encoding="utf-8") as _f:
+        json.dump(existing, _f, indent=2)
+    return out
+
+
+def _standardise_static(
+    df: pd.DataFrame,
+    train_end: int = TRAIN_MAX_WEEK,
+    processed_dir: Path = PROCESSED_DIR,
+) -> pd.DataFrame:
+    """Standardise continuous static cols; persist stats; return modified copy."""
+    out = df.copy()
+    train_mask = out["week"] <= train_end
+    sp: dict[str, list] = {}
+    for col in SEQUENCE_STATIC_CONTINUOUS_COLS:
+        if col not in out.columns:
+            continue
+        col_vals = out.loc[train_mask, col].values
+        col_mean = float(np.nanmean(col_vals))
+        col_std = float(np.nanstd(col_vals, ddof=1))
+        if col_std < 1e-12:
+            col_std = 1.0
+        sp[col] = [col_mean, col_std]
+        out[col] = (out[col] - col_mean) / col_std
+    SCALER_PARAMS.update(sp)
     sp_path = processed_dir / "scaler_params.json"
     existing: dict = {}
     if sp_path.exists():
@@ -403,9 +614,20 @@ def build_dl_sequences(
     if missing:
         raise ValueError(f"build_dl_sequences: missing columns in df: {missing}")
 
-    dl_scale_cols = [c for c in SEQUENCE_TEMPORAL_COLS if c != "num_orders"]
-    if not any(c in SCALER_PARAMS for c in dl_scale_cols):
-        df = _standardise_temporal(df, train_end=TRAIN_MAX_WEEK, processed_dir=processed_dir)
+    # Stash raw num_orders before scaling — y target must remain un-scaled for RMSLE
+    df = df.copy()
+    df["num_orders_raw"] = df["num_orders"].copy()
+    df = _standardise_temporal(df, train_end=TRAIN_MAX_WEEK, processed_dir=processed_dir)
+    df = _standardise_static(df, train_end=TRAIN_MAX_WEEK, processed_dir=processed_dir)
+
+    # Fill NaN from early-series rolling/EWM values (min_periods not met at start of each series)
+    fill_cols = [c for c in SEQUENCE_TEMPORAL_COLS + SEQUENCE_STATIC_COLS if c in df.columns and df[c].isna().any()]
+    if fill_cols:
+        df[fill_cols] = (
+            df.groupby(["center_id", "meal_id"])[fill_cols]
+            .transform(lambda s: s.ffill().bfill())
+        )
+        df[fill_cols] = df[fill_cols].fillna(0.0)
 
     seq_dir = processed_dir / "sequences"
     seq_dir.mkdir(parents=True, exist_ok=True)
@@ -427,7 +649,13 @@ def build_dl_sequences(
         for split_name, (start, end) in split_config.items():
             is_train = split_name == "train"
             for W in range(start, end + 1):
-                lb_weeks = list(range(W - lookback, W))
+                # Anchor week W is the LAST observed week: the lookback window ends at W
+                # (inclusive) so the most recent demand (week W) is available to the model,
+                # and h=1 is a true 1-step-ahead forecast of W+1 — matching the ML setup
+                # (make_horizon_target pairs features@W with target W+h). Previously the
+                # window ended at W-1, silently discarding week W and making h=1 a 2-step
+                # forecast, which crippled short-horizon accuracy.
+                lb_weeks = list(range(W - lookback + 1, W + 1))
                 tgt_weeks = list(range(W + 1, W + horizons + 1))
                 if not all(w in week_set for w in lb_weeks):
                     continue
@@ -441,7 +669,7 @@ def build_dl_sequences(
                 tgt_idx = [week_to_row[w] for w in tgt_weeks]
                 X_t = group.iloc[lb_idx][SEQUENCE_TEMPORAL_COLS].to_numpy(dtype=np.float32)
                 X_s = group.iloc[week_to_row[W]][SEQUENCE_STATIC_COLS].to_numpy(dtype=np.float32)
-                y_v = group.iloc[tgt_idx]["num_orders"].to_numpy(dtype=np.float32)
+                y_v = np.log1p(group.iloc[tgt_idx]["num_orders_raw"].to_numpy(dtype=np.float32))
                 Xt_lists[split_name].append(X_t)
                 Xs_lists[split_name].append(X_s)
                 y_lists[split_name].append(y_v)
@@ -496,6 +724,7 @@ def save_feature_table_tex(out_dir: Path = TABLES_DIR) -> Path:
         "ewm_span10":          ("float", "Exponentially weighted mean, span=10",           "Both"),
         "ewm_span13":          ("float", "Exponentially weighted mean, span=13",           "Both"),
         "ewm_span26":          ("float", "Exponentially weighted mean, span=26",           "Both"),
+        "ewm_alpha05":         ("float", "Exponentially weighted mean, $\\alpha=0.5$",     "Both"),
         "discount_rate":       ("float", "(base\\_price$-$checkout\\_price)/base\\_price", "Both"),
         "log_checkout_price":  ("float", "$\\log$(checkout\\_price$+1$)",                  "Both"),
         "emailer_for_promotion": ("int", "Email promotion flag (0/1)",                    "Both"),
@@ -509,15 +738,38 @@ def save_feature_table_tex(out_dir: Path = TABLES_DIR) -> Path:
         "center_std_orders":   ("float", "Std demand per centre (train weeks only)",       "Both"),
         "meal_mean_orders":    ("float", "Mean demand per meal (train weeks only)",        "Both"),
         "meal_std_orders":     ("float", "Std demand per meal (train weeks only)",         "Both"),
-        "center_type_enc":     ("int",   "Label-encoded centre type",                      "Both"),
-        "category_enc":        ("int",   "Label-encoded meal category",                   "Both"),
-        "cuisine_enc":         ("int",   "Label-encoded cuisine",                          "Both"),
+        "center_type_enc":          ("int",   "Label-encoded centre type",                               "Both"),
+        "category_enc":             ("int",   "Label-encoded meal category",                            "Both"),
+        "cuisine_enc":              ("int",   "Label-encoded cuisine",                                  "Both"),
+        "base_price_max":           ("float", "Max base price for meal (train weeks)",                  "Both"),
+        "base_price_mean":          ("float", "Mean base price for meal (train weeks)",                 "Both"),
+        "base_price_min":           ("float", "Min base price for meal (train weeks)",                  "Both"),
+        "meal_price_max":           ("float", "Max checkout price for meal (train weeks)",              "Both"),
+        "meal_price_mean":          ("float", "Mean checkout price for meal (train weeks)",             "Both"),
+        "meal_price_min":           ("float", "Min checkout price for meal (train weeks)",              "Both"),
+        "meal_count":               ("int",   "Total orders for meal across all centres (train)",       "Both"),
+        "center_cat_count":         ("int",   "Total orders for category in centre (train)",            "Both"),
+        "center_cui_count":         ("int",   "Total orders for cuisine in centre (train)",             "Both"),
+        "region_meal_count":        ("int",   "Total orders for meal in region (train)",                "Both"),
+        "center_price_rank":        ("float", "Dense rank of meal price within centre (train)",         "Both"),
+        "center_cat_price_rank":    ("float", "Dense rank of category price within centre (train)",     "Both"),
+        "meal_city_price_rank":     ("float", "Dense rank of meal price within city (train)",           "Both"),
+        "meal_price_rank":          ("float", "Dense rank of meal price globally (train)",              "Both"),
+        "meal_region_price_rank":   ("float", "Dense rank of meal price within region (train)",         "Both"),
+        "center_week_count":        ("int",   "Total orders in centre for given week",                  "Both"),
+        "center_cat_week_count":    ("int",   "Total orders for category in centre for given week",     "Both"),
+        "city_meal_week_count":     ("int",   "Total orders for meal in city for given week",           "Both"),
+        "meal_week_count":          ("int",   "Total orders for meal across all centres for given week","Both"),
+        "region_meal_week_count":   ("int",   "Total orders for meal in region for given week",         "Both"),
+        "type_meal_week_count":     ("int",   "Total orders for meal in centre type for given week",    "Both"),
+        "center_week_price_rank":   ("float", "Dense rank of meal price in centre for given week",      "Both"),
+        "meal_week_price_rank":     ("float", "Dense rank of meal price globally for given week",       "Both"),
     }
 
     lines = [
         r"\begin{table}[ht]",
         r"\centering",
-        r"\caption{Feature Engineering: 31 Model-Input Columns}",
+        r"\caption{Feature Engineering: 54 Model-Input Columns}",
         r"\label{tab:features}",
         r"\begin{tabular}{llp{5.5cm}l}",
         r"\toprule",
