@@ -1,0 +1,39 @@
+# Article_forecast — Python dependencies
+#
+# Lower-bound pins, chosen to install cleanly on Google Colab (which ships
+# recent numpy/pandas) while staying compatible with the versions used during
+# local development.
+#
+# NOTE on PyTorch: do NOT install torch from here on Colab. Colab ships a
+# CUDA-enabled torch build; `pip install torch` here would replace it with a
+# CPU wheel and you'd lose the GPU. The colab_setup notebook skips torch on
+# Colab. For a local CPU/GPU install, see the commented line at the bottom.
+
+# --- core numerics / data ---
+numpy>=1.26
+pandas>=2.2
+scipy>=1.11
+pyarrow>=14.0          # parquet I/O (feature_matrix.parquet, merged.parquet)
+joblib>=1.3            # model (de)serialisation for the sklearn/boosting models
+
+# --- gradient-boosted trees + classic ML ---
+scikit-learn>=1.4      # LinearRegression, RandomForestRegressor, LabelEncoder
+xgboost>=2.0
+lightgbm>=4.0
+catboost>=1.2
+
+# --- plotting ---
+matplotlib>=3.7
+seaborn>=0.13
+
+# --- deep learning ---
+# torch is intentionally NOT pinned here (see note above). Uncomment for a
+# local install if you are NOT on Colab:
+# torch>=2.2
+
+# ----------------------------------------------------------------------------
+# Reproducibility reference — exact versions on the original dev machine:
+#   torch 2.11.0+cu128 · numpy 2.4.4 · pandas 3.0.2 · scikit-learn 1.8.0
+#   xgboost 3.3.0 · lightgbm 4.6.0 · catboost 1.2.10 · seaborn 0.13.2
+#   scipy 1.17.1 · pyarrow 24.0.0
+# Pin to these if you need bit-for-bit reproduction rather than Colab defaults.
