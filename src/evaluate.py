@@ -225,7 +225,18 @@ def plot_lstm_vs_ml(
         return
 
     df_rmsle = pd.read_csv(rmsle_path, index_col="model")
-    ml_candidates = [m for m in ("xgboost", "lightgbm", "random_forest") if m in df_rmsle.index]
+    ml_candidates = [
+        m for m in ("xgboost", "lightgbm", "catboost", "random_forest")
+        if m in df_rmsle.index
+    ]
+    if not ml_candidates:
+        print(
+            f"[plot_lstm_vs_ml] No ML baseline rows (xgboost/lightgbm/catboost/"
+            f"random_forest) found in {rmsle_path}; skipping LSTM-vs-ML comparison "
+            "figures. Run `python src/ml_models.py` on this machine first so the "
+            "all_models_*.csv files contain the tree-model rows."
+        )
+        return
     best_ml = df_rmsle.loc[ml_candidates, "h01"].idxmin()
 
     col_names = [f"h{h:02d}" for h in range(1, 11)]
@@ -284,7 +295,10 @@ def merge_lstm_metrics(
             df = pd.DataFrame(columns=["model"] + col_names)
         df = df[df["model"] != "lstm"].copy()
         new_row = {"model": "lstm", **{col: float(v) for col, v in zip(col_names, vals)}}
-        df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+        new_df = pd.DataFrame([new_row])
+        # Avoid pandas FutureWarning when df is empty (e.g. all_models_*.csv absent):
+        # concatenating into an all-NA/empty frame is deprecated.
+        df = new_df if df.empty else pd.concat([df, new_df], ignore_index=True)
         df.to_csv(csv_path, index=False)
         print(f"[merge_lstm_metrics] Updated {csv_path}")
 
@@ -439,24 +453,27 @@ def plot_lstm_config_predictions(
 if __name__ == "__main__":
     from pathlib import Path
     from lstm_model import (
-        # CONFIG_A, CONFIG_B,
+        CONFIG_A, CONFIG_B,
           CONFIG_C, 
-        #   CONFIG_A_BI, CONFIG_B_BI, 
+          CONFIG_A_BI, CONFIG_B_BI, 
         LSTMArchConfig,
     )
 
-    log_path = TABLES_DIR / "lstm_arch_experiments.csv"
-    if log_path.exists():
-        df_log = pd.read_csv(log_path)
-        best_row = df_log.loc[df_log["val_rmsle"].idxmin()]
-        best_config = LSTMArchConfig.from_json(best_row["config_json"])
-        best_name = str(best_row["config_name"])
-    else:
-        print("Warning: no experiment log found; defaulting to CONFIG_A")
-        best_config = CONFIG_A
-        best_name = "config_a"
+    import torch
 
     ckpt_path = Path("results/models/lstm/lstm_final.pt")
+    # Read the architecture straight from the checkpoint so it always matches the
+    # saved weights. The append-only lstm_arch_experiments.csv must NOT be used for
+    # this: it accumulates rows from older/different architectures, and picking its
+    # global-min val_rmsle row can load a config that mismatches lstm_final.pt
+    # (→ load_state_dict size mismatch).
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    if "config_json" in ckpt:
+        best_config = LSTMArchConfig.from_json(ckpt["config_json"])
+    else:
+        print("Warning: checkpoint has no config_json; falling back to CONFIG_C")
+        best_config = CONFIG_C
+
     results = evaluate_lstm(best_config, ckpt_path)
     print(f"Eval RMSLE  h=1..10: {[f'{v:.4f}' for v in results['rmsle']]}")
     print(f"Eval MAE    h=1..10: {[f'{v:.4f}' for v in results['mae']]}")
@@ -466,11 +483,11 @@ if __name__ == "__main__":
     plot_lstm_vs_ml(results)
 
     all_configs = [
-        # ("config_a",    CONFIG_A),
-        # ("config_b",    CONFIG_B),
+        ("config_a",    CONFIG_A),
+        ("config_b",    CONFIG_B),
         ("config_c",    CONFIG_C),
-        # ("config_a_bi", CONFIG_A_BI),
-        # ("config_b_bi", CONFIG_B_BI),
+        ("config_a_bi", CONFIG_A_BI),
+        ("config_b_bi", CONFIG_B_BI),
     ]
     plot_lstm_config_predictions(all_configs)
     print("Figures saved to results/figures/")

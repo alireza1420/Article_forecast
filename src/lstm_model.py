@@ -18,10 +18,16 @@ from torch.utils.data import DataLoader, Dataset
 SEED: int = 42
 LR: float = 5e-4
 WEIGHT_DECAY: float = 1e-4
-BATCH_SIZE: int = 256
+BATCH_SIZE: int = 64
 MAX_EPOCHS: int = 300
 MAX_EPOCHS_CPU: int = 50
-PATIENCE: int = 20
+PATIENCE: int = 20            # early-stopping patience (epochs without val improvement)
+# LR scheduler: drop LR well before early-stopping fires so later epochs stay productive.
+# Evidence from runs: val RMSLE improved right after the first LR halving, so we want
+# several halvings inside the early-stop window rather than just one.
+LR_SCHEDULER_PATIENCE: int = 5
+LR_SCHEDULER_FACTOR: float = 0.5
+MIN_LR: float = 1e-6
 # 32 features: all SEQUENCE_TEMPORAL_COLS (num_orders, prices, promotions, EWMs, rolling stats, calendar, ranks)
 N_TEMPORAL: int = 32
 N_STATIC: int = 21
@@ -87,67 +93,66 @@ class LSTMArchConfig:
         return cls(**json.loads(s))
 
 
-# # Paper-matching architectures (Section IV.B: 32→16 hidden units)
-# CONFIG_A: LSTMArchConfig = LSTMArchConfig(
-#     lstm_layers=[
-#         {"hidden_size": 32, "dropout": 0.25},
-#         {"hidden_size": 16, "dropout": 0.0},
-#     ],
-#     head_layers=[
-#         {"type": "relu"},
-#         {"type": "dropout", "p": 0.1},
-#         {"type": "linear", "out_features": 10},
-#     ],
-#     bidirectional=False,
-# )
+# Paper-matching architectures (Section IV.B: 32→16 hidden units)
+CONFIG_A: LSTMArchConfig = LSTMArchConfig(
+    lstm_layers=[
+        {"hidden_size": 32, "dropout": 0.25},
+        {"hidden_size": 16, "dropout": 0.0},
+    ],
+    head_layers=[
+        {"type": "relu"},
+        {"type": "dropout", "p": 0.1},
+        {"type": "linear", "out_features": 10},
+    ],
+    bidirectional=False,
+)
 
-# CONFIG_A_BI: LSTMArchConfig = LSTMArchConfig(
-#     lstm_layers=[
-#         {"hidden_size": 32, "dropout": 0.25},
-#         {"hidden_size": 16, "dropout": 0.0},
-#     ],
-#     head_layers=[
-#         {"type": "relu"},
-#         {"type": "dropout", "p": 0.1},
-#         {"type": "linear", "out_features": 10},
-#     ],
-#     bidirectional=True,
-# )
+CONFIG_A_BI: LSTMArchConfig = LSTMArchConfig(
+    lstm_layers=[
+        {"hidden_size": 32, "dropout": 0.25},
+        {"hidden_size": 16, "dropout": 0.0},
+    ],
+    head_layers=[
+        {"type": "relu"},
+        {"type": "dropout", "p": 0.1},
+        {"type": "linear", "out_features": 10},
+    ],
+    bidirectional=True,
+)
 
-# # Larger ablation variants
-# CONFIG_B: LSTMArchConfig = LSTMArchConfig(
-#     lstm_layers=[
-#         {"hidden_size": 64, "dropout": 0.2},
-#         {"hidden_size": 32, "dropout": 0.1},
-#     ],
-#     head_layers=[
-#         {"type": "relu"},
-#         {"type": "dropout", "p": 0.1},
-#         {"type": "linear", "out_features": 10},
-#     ],
-#     bidirectional=False,
-# )
+# Larger ablation variants
+CONFIG_B: LSTMArchConfig = LSTMArchConfig(
+    lstm_layers=[
+        {"hidden_size": 64, "dropout": 0.2},
+        {"hidden_size": 32, "dropout": 0.1},
+    ],
+    head_layers=[
+        {"type": "relu"},
+        {"type": "dropout", "p": 0.1},
+        {"type": "linear", "out_features": 10},
+    ],
+    bidirectional=False,
+)
 
-# CONFIG_B_BI: LSTMArchConfig = LSTMArchConfig(
-#     lstm_layers=[
-#         {"hidden_size": 64, "dropout": 0.2},
-#         {"hidden_size": 32, "dropout": 0.1},
-#     ],
-#     head_layers=[
-#         {"type": "relu"},
-#         {"type": "dropout", "p": 0.1},
-#         {"type": "linear", "out_features": 10},
-#     ],
-#     bidirectional=True,
-# )
+CONFIG_B_BI: LSTMArchConfig = LSTMArchConfig(
+    lstm_layers=[
+        {"hidden_size": 64, "dropout": 0.2},
+        {"hidden_size": 32, "dropout": 0.1},
+    ],
+    head_layers=[
+        {"type": "relu"},
+        {"type": "dropout", "p": 0.1},
+        {"type": "linear", "out_features": 10},
+    ],
+    bidirectional=True,
+)
 
 CONFIG_C: LSTMArchConfig = LSTMArchConfig(
-    # Uniform stacked LSTM: hidden=128, num_layers=3, recurrent dropout=0.3.
+    # Uniform stacked LSTM: hidden=128, num_layers=2, recurrent dropout=0.3.
     # DemandRNN reads hidden/num_layers/dropout from these entries and builds its own
     # fusion + skip head (head_layers below only declares the output width=10 so the
     # ablation/validation machinery keeps working).
     lstm_layers=[
-        {"hidden_size": 128, "dropout": 0.3},
         {"hidden_size": 128, "dropout": 0.3},
         {"hidden_size": 128, "dropout": 0.3},
     ],
@@ -319,7 +324,8 @@ def train(
         model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimiser, mode="min", factor=0.5, patience=10, min_lr=1e-6
+        optimiser, mode="min", factor=LR_SCHEDULER_FACTOR,
+        patience=LR_SCHEDULER_PATIENCE, min_lr=MIN_LR,
     )
 
     best_val_rmsle = float("inf")
@@ -419,11 +425,11 @@ def run_ablation(
     log_path = Path("results/tables/lstm_arch_experiments.csv")
 
     configs = [
-        # ("config_a",    CONFIG_A),
-        # ("config_b",    CONFIG_B),
+        ("config_a",    CONFIG_A),
+        ("config_b",    CONFIG_B),
         ("config_c",    CONFIG_C),
-        # ("config_a_bi", CONFIG_A_BI),
-        # ("config_b_bi", CONFIG_B_BI),
+        ("config_a_bi", CONFIG_A_BI),
+        ("config_b_bi", CONFIG_B_BI),
     ]
     states: dict[str, dict] = {}
 
