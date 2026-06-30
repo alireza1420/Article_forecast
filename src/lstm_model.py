@@ -328,11 +328,11 @@ def train(
     patience: int = PATIENCE,
 ) -> dict:
     """Full training loop: data → model → Adam → early stop → checkpoint."""
-    if not torch.cuda.is_available():
-        raise RuntimeError(
-            "[train] CUDA is required but not available. "
-            "Install a CUDA-enabled PyTorch build: https://pytorch.org/get-started/locally/"
-        )
+    # if not torch.cuda.is_available():
+    #     raise RuntimeError(
+    #         "[train] CUDA is required but not available. "
+    #         "Install a CUDA-enabled PyTorch build: https://pytorch.org/get-started/locally/"
+    #     )
     device = torch.device("cuda")
     if max_epochs is None:
         max_epochs = MAX_EPOCHS
