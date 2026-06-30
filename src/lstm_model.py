@@ -13,6 +13,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
+from features import SEQUENCE_TEMPORAL_COLS, SEQUENCE_STATIC_COLS  # canonical stored feature order
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 SEED: int = 42
@@ -28,10 +30,36 @@ PATIENCE: int = 20            # early-stopping patience (epochs without val impr
 LR_SCHEDULER_PATIENCE: int = 5
 LR_SCHEDULER_FACTOR: float = 0.5
 MIN_LR: float = 1e-6
-# 32 features: all SEQUENCE_TEMPORAL_COLS (num_orders, prices, promotions, EWMs, rolling stats, calendar, ranks)
+# 32 features: full SEQUENCE_TEMPORAL_COLS stored in the .npy arrays (still used by the IMS model)
 N_TEMPORAL: int = 32
 N_STATIC: int = 21
 PAPER_LOOKBACK: int = 10  # 10-timestep input window
+
+# Curated subset of temporal features fed to DemandRNN at EACH timestep. DemandDataset
+# slices these out of the stored 32-feature arrays, so build_dl_sequences need not re-run.
+LSTM_TEMPORAL_COLS: list[str] = [
+    "num_orders",             # core demand sequence
+    "checkout_price",         # price dynamics
+    "base_price",             # price dynamics
+    "rolling_std_4w",         # market volatility
+    "week_of_year_sin",       # cyclical seasonality
+    "week_of_year_cos",       # cyclical seasonality
+    "homepage_featured",      # promotional shock
+    "emailer_for_promotion",  # promotional shock
+]
+LSTM_TEMPORAL_IDX: list[int] = [SEQUENCE_TEMPORAL_COLS.index(c) for c in LSTM_TEMPORAL_COLS]
+N_TEMPORAL_LSTM: int = len(LSTM_TEMPORAL_COLS)  # DemandRNN input width (was 32)
+
+# Curated subset of static features fused at the head — true structural identities the
+# sequence cannot reconstruct. Sliced from the stored 21-feature arrays (no re-run needed).
+LSTM_STATIC_COLS: list[str] = [
+    "center_type_enc",  # center format
+    "category_enc",     # meal category
+    "cuisine_enc",      # cuisine
+    "op_area",          # center operational area (fixed structural size)
+]
+LSTM_STATIC_IDX: list[int] = [SEQUENCE_STATIC_COLS.index(c) for c in LSTM_STATIC_COLS]
+N_STATIC_LSTM: int = len(LSTM_STATIC_COLS)  # DemandRNN static-head width (was 21)
 
 # Architecture knobs (selected empirically; see DemandRNN docstring)
 SKIP_K: int = 3           # last K weeks' full feature snapshots fed directly to the head
@@ -246,19 +274,20 @@ class RMSLELoss(nn.Module):
 # ── DemandDataset ─────────────────────────────────────────────────────────────
 
 class DemandDataset(Dataset):
-    """Uses all 32 SEQUENCE_TEMPORAL_COLS over the last PAPER_LOOKBACK timesteps."""
+    """Feeds the LSTM_TEMPORAL_COLS subset over the last PAPER_LOOKBACK timesteps."""
 
     def __init__(self, split: str, seq_dir: Path = SEQ_DIR) -> None:
         seq_dir = Path(seq_dir)
         X_full = np.load(seq_dir / f"{split}_X_temporal.npy")  # (N, 26, 32)
         X_stat = np.load(seq_dir / f"{split}_X_static.npy")    # (N, 21)
+        X_stat = X_stat[:, LSTM_STATIC_IDX]                     # -> (N, N_STATIC_LSTM)
         y = np.load(seq_dir / f"{split}_y.npy")
 
         T_seq = X_full.shape[1]
         positions = np.arange(T_seq - PAPER_LOOKBACK, T_seq)
 
-        # (N, 10, 32) — all temporal features over the lookback window
-        X_new = X_full[:, positions, :].astype(np.float32)
+        # (N, PAPER_LOOKBACK, N_TEMPORAL_LSTM) — curated temporal subset over the window
+        X_new = X_full[:, positions, :][:, :, LSTM_TEMPORAL_IDX].astype(np.float32)
 
         nan_mask = (
             np.isnan(X_new).any(axis=(1, 2)) | np.isnan(X_stat).any(axis=1)
@@ -284,8 +313,8 @@ class DemandDataset(Dataset):
 # ── build_model ───────────────────────────────────────────────────────────────
 
 def build_model(config: LSTMArchConfig) -> DemandRNN:
-    """Instantiate DemandRNN with N_TEMPORAL=32, N_STATIC=21."""
-    return DemandRNN(N_TEMPORAL, N_STATIC, config)
+    """Instantiate DemandRNN with the curated temporal (N_TEMPORAL_LSTM) and static (N_STATIC_LSTM) subsets."""
+    return DemandRNN(N_TEMPORAL_LSTM, N_STATIC_LSTM, config)
 
 
 # ── train ──────────────────────────────────────────────────────────────────────
