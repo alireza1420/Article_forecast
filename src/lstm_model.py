@@ -142,11 +142,12 @@ class LSTMArchConfig:
 # )
 
 CONFIG_C: LSTMArchConfig = LSTMArchConfig(
-    # Uniform stacked LSTM: hidden=128, num_layers=2, recurrent dropout=0.3.
+    # Uniform stacked LSTM: hidden=128, num_layers=3, recurrent dropout=0.3.
     # DemandRNN reads hidden/num_layers/dropout from these entries and builds its own
     # fusion + skip head (head_layers below only declares the output width=10 so the
     # ablation/validation machinery keeps working).
     lstm_layers=[
+        {"hidden_size": 128, "dropout": 0.3},
         {"hidden_size": 128, "dropout": 0.3},
         {"hidden_size": 128, "dropout": 0.3},
     ],
