@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader, Dataset
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 SEED: int = 42
-LR: float = 5e-4
+LR: float = 1e-4
 WEIGHT_DECAY: float = 1e-4
 BATCH_SIZE: int = 64
 MAX_EPOCHS: int = 300
