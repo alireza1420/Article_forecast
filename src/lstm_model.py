@@ -13,14 +13,12 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
-from features import SEQUENCE_TEMPORAL_COLS, SEQUENCE_STATIC_COLS  # canonical stored feature order
-
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 SEED: int = 42
 LR: float = 5e-4
 WEIGHT_DECAY: float = 1e-4
-BATCH_SIZE: int = 128
+BATCH_SIZE: int = 64
 MAX_EPOCHS: int = 300
 MAX_EPOCHS_CPU: int = 50
 PATIENCE: int = 20            # early-stopping patience (epochs without val improvement)
@@ -30,40 +28,14 @@ PATIENCE: int = 20            # early-stopping patience (epochs without val impr
 LR_SCHEDULER_PATIENCE: int = 5
 LR_SCHEDULER_FACTOR: float = 0.5
 MIN_LR: float = 1e-6
-# 32 features: full SEQUENCE_TEMPORAL_COLS stored in the .npy arrays (still used by the IMS model)
+# 32 features: all SEQUENCE_TEMPORAL_COLS (num_orders, prices, promotions, EWMs, rolling stats, calendar, ranks)
 N_TEMPORAL: int = 32
 N_STATIC: int = 21
 PAPER_LOOKBACK: int = 10  # 10-timestep input window
 
-# Curated subset of temporal features fed to DemandRNN at EACH timestep. DemandDataset
-# slices these out of the stored 32-feature arrays, so build_dl_sequences need not re-run.
-LSTM_TEMPORAL_COLS: list[str] = [
-    "num_orders",             # core demand sequence
-    "checkout_price",         # price dynamics
-    "base_price",             # price dynamics
-    "rolling_std_4w",         # market volatility
-    "week_of_year_sin",       # cyclical seasonality
-    "week_of_year_cos",       # cyclical seasonality
-    "homepage_featured",      # promotional shock
-    "emailer_for_promotion",  # promotional shock
-]
-LSTM_TEMPORAL_IDX: list[int] = [SEQUENCE_TEMPORAL_COLS.index(c) for c in LSTM_TEMPORAL_COLS]
-N_TEMPORAL_LSTM: int = len(LSTM_TEMPORAL_COLS)  # DemandRNN input width (was 32)
-
-# Curated subset of static features fused at the head — true structural identities the
-# sequence cannot reconstruct. Sliced from the stored 21-feature arrays (no re-run needed).
-LSTM_STATIC_COLS: list[str] = [
-    "center_type_enc",  # center format
-    "category_enc",     # meal category
-    "cuisine_enc",      # cuisine
-    "op_area",          # center operational area (fixed structural size)
-]
-LSTM_STATIC_IDX: list[int] = [SEQUENCE_STATIC_COLS.index(c) for c in LSTM_STATIC_COLS]
-N_STATIC_LSTM: int = len(LSTM_STATIC_COLS)  # DemandRNN static-head width (was 21)
-
 # Architecture knobs (selected empirically; see DemandRNN docstring)
-SKIP_K: int = 0         # last K weeks' full feature snapshots fed directly to the head
-STATIC_FUSE_DIM: int = 16  # width of the static-feature projection concatenated at the head
+SKIP_K: int = 3           # last K weeks' full feature snapshots fed directly to the head
+STATIC_FUSE_DIM: int = 64  # width of the static-feature projection concatenated at the head
 HEAD_DROPOUT: float = 0.3
 
 SEQ_DIR: Path = Path("data/processed/sequences")
@@ -121,59 +93,59 @@ class LSTMArchConfig:
         return cls(**json.loads(s))
 
 
-# # Paper-matching architectures (Section IV.B: 32→16 hidden units)
-# CONFIG_A: LSTMArchConfig = LSTMArchConfig(
-#     lstm_layers=[
-#         {"hidden_size": 32, "dropout": 0.25},
-#         {"hidden_size": 16, "dropout": 0.0},
-#     ],
-#     head_layers=[
-#         {"type": "relu"},
-#         {"type": "dropout", "p": 0.1},
-#         {"type": "linear", "out_features": 10},
-#     ],
-#     bidirectional=False,
-# )
+# Paper-matching architectures (Section IV.B: 32→16 hidden units)
+CONFIG_A: LSTMArchConfig = LSTMArchConfig(
+    lstm_layers=[
+        {"hidden_size": 32, "dropout": 0.25},
+        {"hidden_size": 16, "dropout": 0.0},
+    ],
+    head_layers=[
+        {"type": "relu"},
+        {"type": "dropout", "p": 0.1},
+        {"type": "linear", "out_features": 10},
+    ],
+    bidirectional=False,
+)
 
-# CONFIG_A_BI: LSTMArchConfig = LSTMArchConfig(
-#     lstm_layers=[
-#         {"hidden_size": 32, "dropout": 0.25},
-#         {"hidden_size": 16, "dropout": 0.0},
-#     ],
-#     head_layers=[
-#         {"type": "relu"},
-#         {"type": "dropout", "p": 0.1},
-#         {"type": "linear", "out_features": 10},
-#     ],
-#     bidirectional=True,
-# )
+CONFIG_A_BI: LSTMArchConfig = LSTMArchConfig(
+    lstm_layers=[
+        {"hidden_size": 32, "dropout": 0.25},
+        {"hidden_size": 16, "dropout": 0.0},
+    ],
+    head_layers=[
+        {"type": "relu"},
+        {"type": "dropout", "p": 0.1},
+        {"type": "linear", "out_features": 10},
+    ],
+    bidirectional=True,
+)
 
-# # Larger ablation variants
-# CONFIG_B: LSTMArchConfig = LSTMArchConfig(
-#     lstm_layers=[
-#         {"hidden_size": 64, "dropout": 0.2},
-#         {"hidden_size": 32, "dropout": 0.1},
-#     ],
-#     head_layers=[
-#         {"type": "relu"},
-#         {"type": "dropout", "p": 0.1},
-#         {"type": "linear", "out_features": 10},
-#     ],
-#     bidirectional=False,
-# )
+# Larger ablation variants
+CONFIG_B: LSTMArchConfig = LSTMArchConfig(
+    lstm_layers=[
+        {"hidden_size": 64, "dropout": 0.2},
+        {"hidden_size": 32, "dropout": 0.1},
+    ],
+    head_layers=[
+        {"type": "relu"},
+        {"type": "dropout", "p": 0.1},
+        {"type": "linear", "out_features": 10},
+    ],
+    bidirectional=False,
+)
 
-# CONFIG_B_BI: LSTMArchConfig = LSTMArchConfig(
-#     lstm_layers=[
-#         {"hidden_size": 64, "dropout": 0.2},
-#         {"hidden_size": 32, "dropout": 0.1},
-#     ],
-#     head_layers=[
-#         {"type": "relu"},
-#         {"type": "dropout", "p": 0.1},
-#         {"type": "linear", "out_features": 10},
-#     ],
-#     bidirectional=True,
-# )
+CONFIG_B_BI: LSTMArchConfig = LSTMArchConfig(
+    lstm_layers=[
+        {"hidden_size": 64, "dropout": 0.2},
+        {"hidden_size": 32, "dropout": 0.1},
+    ],
+    head_layers=[
+        {"type": "relu"},
+        {"type": "dropout", "p": 0.1},
+        {"type": "linear", "out_features": 10},
+    ],
+    bidirectional=True,
+)
 
 CONFIG_C: LSTMArchConfig = LSTMArchConfig(
     # Uniform stacked LSTM: hidden=128, num_layers=2, recurrent dropout=0.3.
@@ -256,8 +228,7 @@ class DemandRNN(nn.Module):
         feats = [out[:, -1, :]]
         if self.static_fuse is not None:
             feats.append(self.static_fuse(x_static))
-        if SKIP_K > 0:
-            feats.append(x_temporal[:, -SKIP_K:, :].reshape(x_temporal.size(0), -1))
+        feats.append(x_temporal[:, -SKIP_K:, :].reshape(x_temporal.size(0), -1))
         return torch.nn.functional.softplus(self.head(torch.cat(feats, dim=-1)))
 
 
@@ -275,20 +246,19 @@ class RMSLELoss(nn.Module):
 # ── DemandDataset ─────────────────────────────────────────────────────────────
 
 class DemandDataset(Dataset):
-    """Feeds the LSTM_TEMPORAL_COLS subset over the last PAPER_LOOKBACK timesteps."""
+    """Uses all 32 SEQUENCE_TEMPORAL_COLS over the last PAPER_LOOKBACK timesteps."""
 
     def __init__(self, split: str, seq_dir: Path = SEQ_DIR) -> None:
         seq_dir = Path(seq_dir)
         X_full = np.load(seq_dir / f"{split}_X_temporal.npy")  # (N, 26, 32)
         X_stat = np.load(seq_dir / f"{split}_X_static.npy")    # (N, 21)
-        X_stat = X_stat[:, LSTM_STATIC_IDX]                     # -> (N, N_STATIC_LSTM)
         y = np.load(seq_dir / f"{split}_y.npy")
 
         T_seq = X_full.shape[1]
         positions = np.arange(T_seq - PAPER_LOOKBACK, T_seq)
 
-        # (N, PAPER_LOOKBACK, N_TEMPORAL_LSTM) — curated temporal subset over the window
-        X_new = X_full[:, positions, :][:, :, LSTM_TEMPORAL_IDX].astype(np.float32)
+        # (N, 10, 32) — all temporal features over the lookback window
+        X_new = X_full[:, positions, :].astype(np.float32)
 
         nan_mask = (
             np.isnan(X_new).any(axis=(1, 2)) | np.isnan(X_stat).any(axis=1)
@@ -314,8 +284,8 @@ class DemandDataset(Dataset):
 # ── build_model ───────────────────────────────────────────────────────────────
 
 def build_model(config: LSTMArchConfig) -> DemandRNN:
-    """Instantiate DemandRNN with the curated temporal (N_TEMPORAL_LSTM) and static (N_STATIC_LSTM) subsets."""
-    return DemandRNN(N_TEMPORAL_LSTM, N_STATIC_LSTM, config)
+    """Instantiate DemandRNN with N_TEMPORAL=32, N_STATIC=21."""
+    return DemandRNN(N_TEMPORAL, N_STATIC, config)
 
 
 # ── train ──────────────────────────────────────────────────────────────────────
@@ -329,11 +299,11 @@ def train(
     patience: int = PATIENCE,
 ) -> dict:
     """Full training loop: data → model → Adam → early stop → checkpoint."""
-    # if not torch.cuda.is_available():
-    #     raise RuntimeError(
-    #         "[train] CUDA is required but not available. "
-    #         "Install a CUDA-enabled PyTorch build: https://pytorch.org/get-started/locally/"
-    #     )
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "[train] CUDA is required but not available. "
+            "Install a CUDA-enabled PyTorch build: https://pytorch.org/get-started/locally/"
+        )
     device = torch.device("cuda")
     if max_epochs is None:
         max_epochs = MAX_EPOCHS
@@ -455,11 +425,11 @@ def run_ablation(
     log_path = Path("results/tables/lstm_arch_experiments.csv")
 
     configs = [
-        # ("config_a",    CONFIG_A),
-        # ("config_b",    CONFIG_B),
+        ("config_a",    CONFIG_A),
+        ("config_b",    CONFIG_B),
         ("config_c",    CONFIG_C),
-        # ("config_a_bi", CONFIG_A_BI),
-        # ("config_b_bi", CONFIG_B_BI),
+        ("config_a_bi", CONFIG_A_BI),
+        ("config_b_bi", CONFIG_B_BI),
     ]
     states: dict[str, dict] = {}
 
