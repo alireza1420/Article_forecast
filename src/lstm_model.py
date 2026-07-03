@@ -66,7 +66,7 @@ LSTM_TEMPORAL_COLS: list[str] | None = [
     "type_meal_week_count",
     "center_week_price_rank",
     "meal_week_price_rank",
-
+    "rolling_mean_4w", "rolling_std_4w", "rolling_min_4w", "rolling_max_4w",
     "rolling_mean_8w", "rolling_std_8w", "rolling_min_8w", "rolling_max_8w",
 ]
 LSTM_STATIC_COLS: list[str] | None = []   # no static features fused at the head
