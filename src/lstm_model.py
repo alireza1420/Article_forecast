@@ -20,7 +20,7 @@ from features import SEQUENCE_TEMPORAL_COLS, SEQUENCE_STATIC_COLS  # canonical s
 SEED: int = 42
 LR: float = 5e-4
 WEIGHT_DECAY: float = 1e-4
-BATCH_SIZE: int = 64
+BATCH_SIZE: int = 128
 MAX_EPOCHS: int = 300
 MAX_EPOCHS_CPU: int = 50
 PATIENCE: int = 20            # early-stopping patience (epochs without val improvement)
@@ -62,8 +62,8 @@ LSTM_STATIC_IDX: list[int] = [SEQUENCE_STATIC_COLS.index(c) for c in LSTM_STATIC
 N_STATIC_LSTM: int = len(LSTM_STATIC_COLS)  # DemandRNN static-head width (was 21)
 
 # Architecture knobs (selected empirically; see DemandRNN docstring)
-SKIP_K: int = 3           # last K weeks' full feature snapshots fed directly to the head
-STATIC_FUSE_DIM: int = 64  # width of the static-feature projection concatenated at the head
+SKIP_K: int = 0         # last K weeks' full feature snapshots fed directly to the head
+STATIC_FUSE_DIM: int = 16  # width of the static-feature projection concatenated at the head
 HEAD_DROPOUT: float = 0.3
 
 SEQ_DIR: Path = Path("data/processed/sequences")
@@ -121,59 +121,59 @@ class LSTMArchConfig:
         return cls(**json.loads(s))
 
 
-# Paper-matching architectures (Section IV.B: 32→16 hidden units)
-CONFIG_A: LSTMArchConfig = LSTMArchConfig(
-    lstm_layers=[
-        {"hidden_size": 32, "dropout": 0.25},
-        {"hidden_size": 16, "dropout": 0.0},
-    ],
-    head_layers=[
-        {"type": "relu"},
-        {"type": "dropout", "p": 0.1},
-        {"type": "linear", "out_features": 10},
-    ],
-    bidirectional=False,
-)
+# # Paper-matching architectures (Section IV.B: 32→16 hidden units)
+# CONFIG_A: LSTMArchConfig = LSTMArchConfig(
+#     lstm_layers=[
+#         {"hidden_size": 32, "dropout": 0.25},
+#         {"hidden_size": 16, "dropout": 0.0},
+#     ],
+#     head_layers=[
+#         {"type": "relu"},
+#         {"type": "dropout", "p": 0.1},
+#         {"type": "linear", "out_features": 10},
+#     ],
+#     bidirectional=False,
+# )
 
-CONFIG_A_BI: LSTMArchConfig = LSTMArchConfig(
-    lstm_layers=[
-        {"hidden_size": 32, "dropout": 0.25},
-        {"hidden_size": 16, "dropout": 0.0},
-    ],
-    head_layers=[
-        {"type": "relu"},
-        {"type": "dropout", "p": 0.1},
-        {"type": "linear", "out_features": 10},
-    ],
-    bidirectional=True,
-)
+# CONFIG_A_BI: LSTMArchConfig = LSTMArchConfig(
+#     lstm_layers=[
+#         {"hidden_size": 32, "dropout": 0.25},
+#         {"hidden_size": 16, "dropout": 0.0},
+#     ],
+#     head_layers=[
+#         {"type": "relu"},
+#         {"type": "dropout", "p": 0.1},
+#         {"type": "linear", "out_features": 10},
+#     ],
+#     bidirectional=True,
+# )
 
-# Larger ablation variants
-CONFIG_B: LSTMArchConfig = LSTMArchConfig(
-    lstm_layers=[
-        {"hidden_size": 64, "dropout": 0.2},
-        {"hidden_size": 32, "dropout": 0.1},
-    ],
-    head_layers=[
-        {"type": "relu"},
-        {"type": "dropout", "p": 0.1},
-        {"type": "linear", "out_features": 10},
-    ],
-    bidirectional=False,
-)
+# # Larger ablation variants
+# CONFIG_B: LSTMArchConfig = LSTMArchConfig(
+#     lstm_layers=[
+#         {"hidden_size": 64, "dropout": 0.2},
+#         {"hidden_size": 32, "dropout": 0.1},
+#     ],
+#     head_layers=[
+#         {"type": "relu"},
+#         {"type": "dropout", "p": 0.1},
+#         {"type": "linear", "out_features": 10},
+#     ],
+#     bidirectional=False,
+# )
 
-CONFIG_B_BI: LSTMArchConfig = LSTMArchConfig(
-    lstm_layers=[
-        {"hidden_size": 64, "dropout": 0.2},
-        {"hidden_size": 32, "dropout": 0.1},
-    ],
-    head_layers=[
-        {"type": "relu"},
-        {"type": "dropout", "p": 0.1},
-        {"type": "linear", "out_features": 10},
-    ],
-    bidirectional=True,
-)
+# CONFIG_B_BI: LSTMArchConfig = LSTMArchConfig(
+#     lstm_layers=[
+#         {"hidden_size": 64, "dropout": 0.2},
+#         {"hidden_size": 32, "dropout": 0.1},
+#     ],
+#     head_layers=[
+#         {"type": "relu"},
+#         {"type": "dropout", "p": 0.1},
+#         {"type": "linear", "out_features": 10},
+#     ],
+#     bidirectional=True,
+# )
 
 CONFIG_C: LSTMArchConfig = LSTMArchConfig(
     # Uniform stacked LSTM: hidden=128, num_layers=2, recurrent dropout=0.3.
@@ -256,7 +256,8 @@ class DemandRNN(nn.Module):
         feats = [out[:, -1, :]]
         if self.static_fuse is not None:
             feats.append(self.static_fuse(x_static))
-        feats.append(x_temporal[:, -SKIP_K:, :].reshape(x_temporal.size(0), -1))
+        if SKIP_K > 0:
+            feats.append(x_temporal[:, -SKIP_K:, :].reshape(x_temporal.size(0), -1))
         return torch.nn.functional.softplus(self.head(torch.cat(feats, dim=-1)))
 
 
@@ -454,11 +455,11 @@ def run_ablation(
     log_path = Path("results/tables/lstm_arch_experiments.csv")
 
     configs = [
-        ("config_a",    CONFIG_A),
-        ("config_b",    CONFIG_B),
+        # ("config_a",    CONFIG_A),
+        # ("config_b",    CONFIG_B),
         ("config_c",    CONFIG_C),
-        ("config_a_bi", CONFIG_A_BI),
-        ("config_b_bi", CONFIG_B_BI),
+        # ("config_a_bi", CONFIG_A_BI),
+        # ("config_b_bi", CONFIG_B_BI),
     ]
     states: dict[str, dict] = {}
 
