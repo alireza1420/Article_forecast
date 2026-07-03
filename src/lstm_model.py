@@ -13,6 +13,13 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
+# canonical stored feature order; dual import keeps both `lstm_model` (scripts, cwd=src
+# on sys.path) and `src.lstm_model` (pytest from repo root) working
+try:
+    from features import SEQUENCE_TEMPORAL_COLS, SEQUENCE_STATIC_COLS
+except ModuleNotFoundError:
+    from src.features import SEQUENCE_TEMPORAL_COLS, SEQUENCE_STATIC_COLS
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 SEED: int = 42
@@ -28,10 +35,39 @@ PATIENCE: int = 20            # early-stopping patience (epochs without val impr
 LR_SCHEDULER_PATIENCE: int = 5
 LR_SCHEDULER_FACTOR: float = 0.5
 MIN_LR: float = 1e-6
-# 32 features: all SEQUENCE_TEMPORAL_COLS (num_orders, prices, promotions, EWMs, rolling stats, calendar, ranks)
+# Full widths of the stored .npy arrays (all SEQUENCE_TEMPORAL_COLS / SEQUENCE_STATIC_COLS)
 N_TEMPORAL: int = 32
 N_STATIC: int = 21
 PAPER_LOOKBACK: int = 10  # 10-timestep input window
+
+# Optional feature selection: lists of names from SEQUENCE_TEMPORAL_COLS /
+# SEQUENCE_STATIC_COLS to slice out of the stored 32/21-feature arrays (no
+# build_dl_sequences re-run needed); None = all features, [] = none (static only).
+# These module defaults can be overridden per call — DemandDataset, build_model, train,
+# and run_ablation all accept temporal_cols/static_cols. train() records the selection
+# in its checkpoint so evaluation rebuilds the model and dataset with matching widths.
+LSTM_TEMPORAL_COLS: list[str] | None = ["num_orders", "rolling_std_4w","checkout_price"]
+LSTM_STATIC_COLS: list[str] | None = []   # no static features fused at the head
+
+
+def _feature_indices(
+    cols: list[str] | None, canonical: list[str], kind: str, allow_empty: bool = False
+) -> list[int]:
+    """Map feature names to their positions in the stored arrays; None → all columns.
+
+    ``allow_empty`` permits ``[]`` (no features) — valid for static (DemandRNN skips the
+    static-fusion head when n_static == 0) but not for temporal (the LSTM needs input).
+    """
+    if cols is None:
+        return list(range(len(canonical)))
+    if not cols and not allow_empty:
+        raise ValueError(f"{kind}_cols must be None (all features) or non-empty")
+    unknown = [c for c in cols if c not in canonical]
+    if unknown:
+        raise ValueError(
+            f"unknown {kind} feature(s) {unknown}; valid names: {canonical}"
+        )
+    return [canonical.index(c) for c in cols]
 
 # Architecture knobs (selected empirically; see DemandRNN docstring)
 SKIP_K: int = 3           # last K weeks' full feature snapshots fed directly to the head
@@ -246,19 +282,46 @@ class RMSLELoss(nn.Module):
 # ── DemandDataset ─────────────────────────────────────────────────────────────
 
 class DemandDataset(Dataset):
-    """Uses all 32 SEQUENCE_TEMPORAL_COLS over the last PAPER_LOOKBACK timesteps."""
+    """Serves the selected temporal/static features over the last PAPER_LOOKBACK timesteps.
 
-    def __init__(self, split: str, seq_dir: Path = SEQ_DIR) -> None:
+    ``temporal_cols`` / ``static_cols`` are lists of names from SEQUENCE_TEMPORAL_COLS /
+    SEQUENCE_STATIC_COLS; None falls back to the module defaults (all features).
+    """
+
+    def __init__(
+        self,
+        split: str,
+        seq_dir: Path = SEQ_DIR,
+        temporal_cols: list[str] | None = None,
+        static_cols: list[str] | None = None,
+    ) -> None:
         seq_dir = Path(seq_dir)
-        X_full = np.load(seq_dir / f"{split}_X_temporal.npy")  # (N, 26, 32)
-        X_stat = np.load(seq_dir / f"{split}_X_static.npy")    # (N, 21)
+        t_idx = _feature_indices(
+            temporal_cols if temporal_cols is not None else LSTM_TEMPORAL_COLS,
+            SEQUENCE_TEMPORAL_COLS, "temporal",
+        )
+        s_idx = _feature_indices(
+            static_cols if static_cols is not None else LSTM_STATIC_COLS,
+            SEQUENCE_STATIC_COLS, "static", allow_empty=True,
+        )
+        X_full = np.load(seq_dir / f"{split}_X_temporal.npy")   # (N, 26, 32)
+        X_stat_full = np.load(seq_dir / f"{split}_X_static.npy")       # (N, 21)
         y = np.load(seq_dir / f"{split}_y.npy")
+
+        # name-based selection only works on arrays stored in canonical column order
+        if max(t_idx, default=-1) >= X_full.shape[2] or max(s_idx, default=-1) >= X_stat_full.shape[1]:
+            raise ValueError(
+                f"stored arrays ({X_full.shape[2]} temporal / {X_stat_full.shape[1]} static cols) "
+                f"are narrower than the requested feature indices — rebuild sequences with "
+                f"build_dl_sequences (expects {len(SEQUENCE_TEMPORAL_COLS)}/{len(SEQUENCE_STATIC_COLS)})"
+            )
+        X_stat = X_stat_full[:, s_idx]                                  # (N, n_static)
 
         T_seq = X_full.shape[1]
         positions = np.arange(T_seq - PAPER_LOOKBACK, T_seq)
 
-        # (N, 10, 32) — all temporal features over the lookback window
-        X_new = X_full[:, positions, :].astype(np.float32)
+        # (N, PAPER_LOOKBACK, n_temporal) — selected temporal features over the window
+        X_new = X_full[:, positions, :][:, :, t_idx].astype(np.float32)
 
         nan_mask = (
             np.isnan(X_new).any(axis=(1, 2)) | np.isnan(X_stat).any(axis=1)
@@ -283,9 +346,21 @@ class DemandDataset(Dataset):
 
 # ── build_model ───────────────────────────────────────────────────────────────
 
-def build_model(config: LSTMArchConfig) -> DemandRNN:
-    """Instantiate DemandRNN with N_TEMPORAL=32, N_STATIC=21."""
-    return DemandRNN(N_TEMPORAL, N_STATIC, config)
+def build_model(
+    config: LSTMArchConfig,
+    temporal_cols: list[str] | None = None,
+    static_cols: list[str] | None = None,
+) -> DemandRNN:
+    """Instantiate DemandRNN sized to the selected features (all 32/21 when None)."""
+    n_temporal = len(_feature_indices(
+        temporal_cols if temporal_cols is not None else LSTM_TEMPORAL_COLS,
+        SEQUENCE_TEMPORAL_COLS, "temporal",
+    ))
+    n_static = len(_feature_indices(
+        static_cols if static_cols is not None else LSTM_STATIC_COLS,
+        SEQUENCE_STATIC_COLS, "static", allow_empty=True,
+    ))
+    return DemandRNN(n_temporal, n_static, config)
 
 
 # ── train ──────────────────────────────────────────────────────────────────────
@@ -297,6 +372,8 @@ def train(
     models_dir: Path = MODELS_DIR,
     max_epochs: int | None = None,
     patience: int = PATIENCE,
+    temporal_cols: list[str] | None = None,
+    static_cols: list[str] | None = None,
 ) -> dict:
     """Full training loop: data → model → Adam → early stop → checkpoint."""
     if not torch.cuda.is_available():
@@ -307,18 +384,23 @@ def train(
     device = torch.device("cuda")
     if max_epochs is None:
         max_epochs = MAX_EPOCHS
+    # resolve module defaults up front so the checkpoint records the effective selection
+    if temporal_cols is None:
+        temporal_cols = LSTM_TEMPORAL_COLS
+    if static_cols is None:
+        static_cols = LSTM_STATIC_COLS
 
     models_dir = Path(models_dir)
     models_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = models_dir / f"best_{config_name}.pt"
 
     set_seed(SEED)
-    train_ds = DemandDataset("train", seq_dir=seq_dir)
-    val_ds = DemandDataset("val", seq_dir=seq_dir)
+    train_ds = DemandDataset("train", seq_dir=seq_dir, temporal_cols=temporal_cols, static_cols=static_cols)
+    val_ds = DemandDataset("val", seq_dir=seq_dir, temporal_cols=temporal_cols, static_cols=static_cols)
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, pin_memory=True)
 
-    model = build_model(config).to(device)
+    model = build_model(config, temporal_cols=temporal_cols, static_cols=static_cols).to(device)
     criterion = nn.MSELoss()
     optimiser = torch.optim.Adam(
         model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY
@@ -337,10 +419,13 @@ def train(
 
     LOG_EVERY = 10  # print a summary line every N epochs
 
+    n_t = len(temporal_cols) if temporal_cols is not None else N_TEMPORAL
+    n_s = len(static_cols) if static_cols is not None else N_STATIC
     print(
         f"[train] {config_name} | device={device} | "
         f"epochs={max_epochs} | patience={patience} | "
-        f"train_samples={len(train_ds)} | val_samples={len(val_ds)}"
+        f"train_samples={len(train_ds)} | val_samples={len(val_ds)} | "
+        f"features: temporal={n_t}/{N_TEMPORAL} static={n_s}/{N_STATIC}"
     )
 
     for epoch in range(max_epochs):
@@ -382,6 +467,9 @@ def train(
                     "state_dict": model.state_dict(),
                     "config_json": config.to_json(),
                     "val_rmsle": val_rmsle,
+                    # feature selection (None = all); evaluation rebuilds matching widths
+                    "temporal_cols": temporal_cols,
+                    "static_cols": static_cols,
                 },
                 ckpt_path,
             )
@@ -417,6 +505,8 @@ def train(
 def run_ablation(
     seq_dir: Path = SEQ_DIR,
     models_dir: Path = MODELS_DIR,
+    temporal_cols: list[str] | None = None,
+    static_cols: list[str] | None = None,
 ) -> str:
     """Train Config A and Config B; return name of the best config."""
     from evaluate import append_experiment_log, plot_training_curves, plot_lstm_config_predictions  # avoid import cycle at module load
@@ -435,7 +525,8 @@ def run_ablation(
 
     for name, cfg in configs:
         print(f"\n[run_ablation] Training {name} ...")
-        state = train(cfg, name, seq_dir=seq_dir, models_dir=models_dir)
+        state = train(cfg, name, seq_dir=seq_dir, models_dir=models_dir,
+                      temporal_cols=temporal_cols, static_cols=static_cols)
         states[name] = state
         append_experiment_log(cfg, name, state["best_val_rmsle"], log_path)
         print(
