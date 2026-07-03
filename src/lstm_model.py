@@ -40,7 +40,7 @@ MIN_LR: float = 1e-6
 # Full widths of the stored .npy arrays (all SEQUENCE_TEMPORAL_COLS / SEQUENCE_STATIC_COLS)
 N_TEMPORAL: int = 32
 N_STATIC: int = 21
-PAPER_LOOKBACK: int = 10  # 10-timestep input window
+PAPER_LOOKBACK: int = 20  # 10-timestep input window
 
 # Optional feature selection: lists of names from SEQUENCE_TEMPORAL_COLS /
 # SEQUENCE_STATIC_COLS to slice out of the stored 32/21-feature arrays (no
@@ -53,13 +53,8 @@ PAPER_LOOKBACK: int = 10  # 10-timestep input window
 LSTM_TEMPORAL_COLS: list[str] | None = [
     "num_orders",
     "checkout_price",
-    "base_price",
     "discount_rate",
     "log_checkout_price",
-    "emailer_for_promotion",
-    "homepage_featured",
-    "email_x_discount",
-    "homepage_x_discount",
     "week_number",
     "week_of_year_sin",
     "week_of_year_cos",
@@ -71,9 +66,7 @@ LSTM_TEMPORAL_COLS: list[str] | None = [
     "type_meal_week_count",
     "center_week_price_rank",
     "meal_week_price_rank",
-    "ewm_alpha05",
-    "ewm_span10",
-    "rolling_mean_4w", "rolling_std_4w", "rolling_min_4w", "rolling_max_4w",
+
     "rolling_mean_8w", "rolling_std_8w", "rolling_min_8w", "rolling_max_8w",
 ]
 LSTM_STATIC_COLS: list[str] | None = []   # no static features fused at the head
