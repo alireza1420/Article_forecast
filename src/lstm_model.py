@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 
 # canonical stored feature order; dual import keeps both `lstm_model` (scripts, cwd=src
 # on sys.path) and `src.lstm_model` (pytest from repo root) working
@@ -24,7 +24,9 @@ except ModuleNotFoundError:
 
 SEED: int = 42
 LR: float = 1e-4
-WEIGHT_DECAY: float = 1e-4
+# Raised 1e-4 → 1e-3: val RMSLE bottomed at epoch ~7 while train loss kept falling
+# (classic overfit divergence), and LR halving didn't help — so penalise capacity, not step size.
+WEIGHT_DECAY: float = 1e-3
 BATCH_SIZE: int = 64
 MAX_EPOCHS: int = 300
 MAX_EPOCHS_CPU: int = 50
@@ -46,7 +48,34 @@ PAPER_LOOKBACK: int = 10  # 10-timestep input window
 # These module defaults can be overridden per call — DemandDataset, build_model, train,
 # and run_ablation all accept temporal_cols/static_cols. train() records the selection
 # in its checkpoint so evaluation rebuilds the model and dataset with matching widths.
-LSTM_TEMPORAL_COLS: list[str] | None = ["num_orders", "rolling_std_4w","checkout_price"]
+# All 32 temporal features, spelled out (canonical order) so lines can be pruned freely;
+# equivalent to None.
+LSTM_TEMPORAL_COLS: list[str] | None = [
+    "num_orders",
+    "checkout_price",
+    "base_price",
+    "discount_rate",
+    "log_checkout_price",
+    "emailer_for_promotion",
+    "homepage_featured",
+    "email_x_discount",
+    "homepage_x_discount",
+    "week_number",
+    "week_of_year_sin",
+    "week_of_year_cos",
+    "center_week_count",
+    "center_cat_week_count",
+    "city_meal_week_count",
+    "meal_week_count",
+    "region_meal_week_count",
+    "type_meal_week_count",
+    "center_week_price_rank",
+    "meal_week_price_rank",
+    "ewm_alpha05",
+    "ewm_span10",
+    "rolling_mean_4w", "rolling_std_4w", "rolling_min_4w", "rolling_max_4w",
+    "rolling_mean_8w", "rolling_std_8w", "rolling_min_8w", "rolling_max_8w",
+]
 LSTM_STATIC_COLS: list[str] | None = []   # no static features fused at the head
 
 
@@ -72,7 +101,14 @@ def _feature_indices(
 # Architecture knobs (selected empirically; see DemandRNN docstring)
 SKIP_K: int = 3           # last K weeks' full feature snapshots fed directly to the head
 STATIC_FUSE_DIM: int = 64  # width of the static-feature projection concatenated at the head
-HEAD_DROPOUT: float = 0.3
+# Head regularisation, tightened against overfitting (best val at epoch ~7, then rising):
+# dropout 0.3 → 0.4 and head widths 128/64 → 64/32. The head is where most capacity sits
+# once the feature set is small (e.g. 3 temporal cols ⇒ LSTM input is tiny but the old
+# 128-wide head could still memorise), so shrinking it targets the actual problem.
+# NOTE: changing HEAD_HIDDEN breaks state_dict compatibility with old checkpoints —
+# retrain rather than loading previous best_*.pt files.
+HEAD_DROPOUT: float = 0.4
+HEAD_HIDDEN: tuple[int, int] = (64, 32)
 
 SEQ_DIR: Path = Path("data/processed/sequences")
 MODELS_DIR: Path = Path("results/models/lstm")
@@ -248,10 +284,11 @@ class DemandRNN(nn.Module):
         )
         fuse_dim = STATIC_FUSE_DIM if n_static > 0 else 0
         head_in = hidden + fuse_dim + n_temporal * SKIP_K
+        h1, h2 = HEAD_HIDDEN
         self.head = nn.Sequential(
-            nn.Linear(head_in, 128), nn.ReLU(), nn.Dropout(HEAD_DROPOUT),
-            nn.Linear(128, 64), nn.ReLU(), nn.Dropout(HEAD_DROPOUT),
-            nn.Linear(64, out_features),
+            nn.Linear(head_in, h1), nn.ReLU(), nn.Dropout(HEAD_DROPOUT),
+            nn.Linear(h1, h2), nn.ReLU(), nn.Dropout(HEAD_DROPOUT),
+            nn.Linear(h2, out_features),
         )
 
     def forward(
@@ -400,6 +437,20 @@ def train(
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, pin_memory=True)
 
+    # Diagnostic loader: fixed random subsample of train, evaluated in eval mode each
+    # epoch so train_rmsle is directly comparable to val_rmsle (same metric, no dropout
+    # noise, ~same cost as the val pass). train_loss (MSE, dropout on) is NOT comparable
+    # to val_rmsle; this is. A large train↔val RMSLE gap ⇒ memorisation; a small gap
+    # with val still rising ⇒ train/val regime shift (walk-forward split), which no
+    # amount of regularisation will fix.
+    diag_n = min(len(train_ds), len(val_ds))
+    diag_idx = torch.randperm(
+        len(train_ds), generator=torch.Generator().manual_seed(SEED)
+    )[:diag_n].tolist()
+    diag_loader = DataLoader(
+        Subset(train_ds, diag_idx), batch_size=BATCH_SIZE, shuffle=False, pin_memory=True
+    )
+
     model = build_model(config, temporal_cols=temporal_cols, static_cols=static_cols).to(device)
     criterion = nn.MSELoss()
     optimiser = torch.optim.Adam(
@@ -414,6 +465,7 @@ def train(
     best_epoch = 0
     patience_counter = 0
     train_losses: list[float] = []
+    train_rmsles: list[float] = []   # eval-mode RMSLE on the fixed train subsample
     val_rmsles: list[float] = []
     last_epoch = 0
 
@@ -443,15 +495,21 @@ def train(
         train_losses.append(epoch_loss / max(len(train_ds), 1))
 
         model.eval()
-        preds, targets = [], []
-        with torch.no_grad():
-            for xt, xs, yb in val_loader:
-                preds.append(model(xt.to(device), xs.to(device)).cpu().numpy())
-                targets.append(yb.numpy())
-        y_pred = np.concatenate(preds)
-        y_true = np.concatenate(targets)
-        val_rmsle = float(np.sqrt(np.mean((y_pred - y_true) ** 2)))
+
+        def _eval_rmsle(loader: DataLoader) -> float:
+            preds, targets = [], []
+            with torch.no_grad():
+                for xt, xs, yb in loader:
+                    preds.append(model(xt.to(device), xs.to(device)).cpu().numpy())
+                    targets.append(yb.numpy())
+            y_pred = np.concatenate(preds)
+            y_true = np.concatenate(targets)
+            return float(np.sqrt(np.mean((y_pred - y_true) ** 2)))
+
+        val_rmsle = _eval_rmsle(val_loader)
+        train_rmsle = _eval_rmsle(diag_loader)
         val_rmsles.append(val_rmsle)
+        train_rmsles.append(train_rmsle)
         scheduler.step(val_rmsle)
 
         current_lr = optimiser.param_groups[0]["lr"]
@@ -481,7 +539,9 @@ def train(
             print(
                 f"  epoch {epoch + 1:>4}/{max_epochs} | "
                 f"train_loss={train_losses[-1]:.4f} | "
+                f"train_rmsle={train_rmsle:.4f} | "
                 f"val_rmsle={val_rmsle:.4f} | "
+                f"gap={val_rmsle - train_rmsle:+.4f} | "
                 f"lr={current_lr:.2e}"
                 f"{tag}"
             )
@@ -495,6 +555,7 @@ def train(
         "best_epoch": best_epoch,
         "early_stop_epoch": last_epoch if patience_counter >= patience else None,
         "train_losses": train_losses,
+        "train_rmsles": train_rmsles,   # eval-mode, same scale as val_rmsles
         "val_rmsles": val_rmsles,
         "checkpoint_path": str(ckpt_path),
     }
