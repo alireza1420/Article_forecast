@@ -96,8 +96,8 @@ class LSTMArchConfig:
 # Paper-matching architectures (Section IV.B: 32→16 hidden units)
 CONFIG_A: LSTMArchConfig = LSTMArchConfig(
     lstm_layers=[
-        {"hidden_size": 32, "dropout": 0.25},
-        {"hidden_size": 16, "dropout": 0.0},
+        {"hidden_size": 32, "dropout": 0.5},
+        {"hidden_size": 16, "dropout": 0.3},
     ],
     head_layers=[
         {"type": "relu"},
@@ -109,8 +109,8 @@ CONFIG_A: LSTMArchConfig = LSTMArchConfig(
 
 CONFIG_A_BI: LSTMArchConfig = LSTMArchConfig(
     lstm_layers=[
-        {"hidden_size": 32, "dropout": 0.25},
-        {"hidden_size": 16, "dropout": 0.0},
+        {"hidden_size": 32, "dropout": 0.5},
+        {"hidden_size": 16, "dropout": 0.3},
     ],
     head_layers=[
         {"type": "relu"},
@@ -123,8 +123,8 @@ CONFIG_A_BI: LSTMArchConfig = LSTMArchConfig(
 # Larger ablation variants
 CONFIG_B: LSTMArchConfig = LSTMArchConfig(
     lstm_layers=[
-        {"hidden_size": 64, "dropout": 0.2},
-        {"hidden_size": 32, "dropout": 0.1},
+        {"hidden_size": 64, "dropout": 0.5},
+        {"hidden_size": 32, "dropout": 0.3},
     ],
     head_layers=[
         {"type": "relu"},
@@ -136,8 +136,8 @@ CONFIG_B: LSTMArchConfig = LSTMArchConfig(
 
 CONFIG_B_BI: LSTMArchConfig = LSTMArchConfig(
     lstm_layers=[
-        {"hidden_size": 64, "dropout": 0.2},
-        {"hidden_size": 32, "dropout": 0.1},
+        {"hidden_size": 64, "dropout": 0.5},
+        {"hidden_size": 32, "dropout": 0.3},
     ],
     head_layers=[
         {"type": "relu"},
@@ -153,7 +153,7 @@ CONFIG_C: LSTMArchConfig = LSTMArchConfig(
     # fusion + skip head (head_layers below only declares the output width=10 so the
     # ablation/validation machinery keeps working).
     lstm_layers=[
-        {"hidden_size": 128, "dropout": 0.3},
+        {"hidden_size": 128, "dropout": 0.5},
         {"hidden_size": 128, "dropout": 0.3},
     ],
     head_layers=[
