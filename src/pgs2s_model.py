@@ -132,10 +132,10 @@ class Seq2SeqLSTM(nn.Module):
                 inp = to_feedback_scale(teacher[:, j - 1])
             else:                                    # policy: a_{k=j} picks input for step j+1
                 a = taken[j - 1] if live else actions[:, j - 1]
-                # codex: Validate action ids before this selection. As written,
-                # any value other than 0 or 1 silently falls through to LGBM,
-                # which can hide policy/indexing bugs and corrupt Teach_* or
-                # PG-S2S forecasts instead of failing loudly.
+                if ((a < 0) | (a > 2)).any():
+                    raise ValueError(
+                        f"invalid action id(s) at step k={j}: "
+                        f"{a[(a < 0) | (a > 2)].unique().tolist()} (must be 0/1/2)")
                 inp = torch.where(
                     a == 0, to_feedback_scale(preds[j - 1]),
                     torch.where(a == 1, aux[:, 0, j - 1], aux[:, 1, j - 1]))

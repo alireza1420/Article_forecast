@@ -417,7 +417,7 @@ def build_all() -> None:
     manifest_path = write_manifest()
     with open(manifest_path) as fh:
         n_files = len(json.load(fh)["files"])
-    print(f"  manifest: {n_files} files → {manifest_path}")
+    print(f"  manifest: {n_files} files -> {manifest_path}")
     print("[pgs2s_data] build-all complete")
 
 
