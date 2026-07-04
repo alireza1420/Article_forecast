@@ -694,9 +694,14 @@ def build_dl_sequences(
         np.save(seq_dir / f"{split_name}_X_static.npy", Xs)
         np.save(seq_dir / f"{split_name}_y.npy", y)
 
-        if split_name == "eval" and meta_lists[split_name]:
-            meta_arr = np.array(meta_lists[split_name], dtype=np.float32)
-            np.save(seq_dir / "eval_meta.npy", meta_arr)
+        # Persist per-sample identity (center_id, meal_id, anchor W) for every split —
+        # row-aligned with X/y by construction (feature 007 FR-1; additive per contract).
+        meta_arr = (
+            np.array(meta_lists[split_name], dtype=np.float32)
+            if meta_lists[split_name]
+            else np.empty((0, 3), dtype=np.float32)
+        )
+        np.save(seq_dir / f"{split_name}_meta.npy", meta_arr)
 
         print(f"{split_name}: X_temporal={Xt.shape} X_static={Xs.shape} y={y.shape}")
         result[split_name] = (Xt, Xs, y)
