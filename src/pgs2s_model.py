@@ -112,6 +112,14 @@ class Seq2SeqLSTM(nn.Module):
                 raise ValueError("policy mode requires aux (B,2,10) cache slice")
             if actions is None and policy is None:
                 raise ValueError("policy mode requires fixed actions or a live policy")
+            if actions is not None:
+                # a_H never feeds a next step but still reaches the rank reward —
+                # validate the full a_1..a_H tensor, not just the consumed prefix.
+                bad = actions[(actions < 0) | (actions > 2)]
+                if bad.numel():
+                    raise ValueError(
+                        f"invalid action id(s) {bad.unique().tolist()} in fixed "
+                        f"actions tensor (must be 0/1/2)")
 
         batch = x_temporal.shape[0]
         _, (h_n, c_n) = self.encoder(x_temporal)
@@ -132,10 +140,6 @@ class Seq2SeqLSTM(nn.Module):
                 inp = to_feedback_scale(teacher[:, j - 1])
             else:                                    # policy: a_{k=j} picks input for step j+1
                 a = taken[j - 1] if live else actions[:, j - 1]
-                if ((a < 0) | (a > 2)).any():
-                    raise ValueError(
-                        f"invalid action id(s) at step k={j}: "
-                        f"{a[(a < 0) | (a > 2)].unique().tolist()} (must be 0/1/2)")
                 inp = torch.where(
                     a == 0, to_feedback_scale(preds[j - 1]),
                     torch.where(a == 1, aux[:, 0, j - 1], aux[:, 1, j - 1]))
@@ -151,6 +155,12 @@ class Seq2SeqLSTM(nn.Module):
         out_actions: torch.Tensor | None = None
         if mode == "policy":
             out_actions = torch.stack(taken, dim=1) if live else actions
+            if live:
+                bad = out_actions[(out_actions < 0) | (out_actions > 2)]
+                if bad.numel():
+                    raise ValueError(
+                        f"policy.act produced invalid action id(s) "
+                        f"{bad.unique().tolist()} (must be 0/1/2)")
         return S2SOutput(
             preds=torch.stack(preds, dim=1),
             states=torch.stack(states, dim=1),
