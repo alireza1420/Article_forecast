@@ -109,7 +109,9 @@ def evaluate_lstm(
     """Load checkpoint; predict eval split; compute 4 metrics; write CSVs."""
     import torch
     from torch.utils.data import DataLoader
-    from lstm_model import DemandDataset, build_model
+    from lstm_model import (
+        DemandDataset, build_model, SEQUENCE_TEMPORAL_COLS, SEQUENCE_STATIC_COLS,
+    )
 
     checkpoint_path = Path(checkpoint_path)
     tables_dir = Path(tables_dir)
@@ -119,12 +121,19 @@ def evaluate_lstm(
     predictions_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = build_model(config).to(device)
     ckpt = torch.load(checkpoint_path, map_location=device)
+    # feature selection recorded at train time; absent/None = all features (explicit
+    # lists so this never depends on lstm_model's current module defaults)
+    t_cols, s_cols = ckpt.get("temporal_cols"), ckpt.get("static_cols")
+    if t_cols is None:
+        t_cols = list(SEQUENCE_TEMPORAL_COLS)
+    if s_cols is None:
+        s_cols = list(SEQUENCE_STATIC_COLS)
+    model = build_model(config, temporal_cols=t_cols, static_cols=s_cols).to(device)
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
 
-    eval_ds = DemandDataset("eval", seq_dir=seq_dir)
+    eval_ds = DemandDataset("eval", seq_dir=seq_dir, temporal_cols=t_cols, static_cols=s_cols)
     loader = DataLoader(eval_ds, batch_size=256, shuffle=False)
 
     preds, targets = [], []
@@ -366,7 +375,9 @@ def plot_lstm_config_predictions(
     """
     import torch
     from torch.utils.data import DataLoader
-    from lstm_model import DemandDataset, build_model
+    from lstm_model import (
+        DemandDataset, build_model, SEQUENCE_TEMPORAL_COLS, SEQUENCE_STATIC_COLS,
+    )
 
     figures_dir = Path(figures_dir)
     figures_dir.mkdir(parents=True, exist_ok=True)
@@ -392,13 +403,24 @@ def plot_lstm_config_predictions(
         if not ckpt_path.exists():
             print(f"[plot_lstm_config_predictions] {ckpt_path} not found; skipping {name}")
             continue
-        model = build_model(cfg).to(device)
         ckpt = torch.load(ckpt_path, map_location=device)
+        # absent/None = all features (explicit, independent of module defaults)
+        t_cols, s_cols = ckpt.get("temporal_cols"), ckpt.get("static_cols")
+        if t_cols is None:
+            t_cols = list(SEQUENCE_TEMPORAL_COLS)
+        if s_cols is None:
+            s_cols = list(SEQUENCE_STATIC_COLS)
+        model = build_model(cfg, temporal_cols=t_cols, static_cols=s_cols).to(device)
         model.load_state_dict(ckpt["state_dict"])
         model.eval()
+        # each checkpoint gets an eval loader sliced to its own feature selection
+        model_loader = DataLoader(
+            DemandDataset("eval", seq_dir=seq_dir, temporal_cols=t_cols, static_cols=s_cols),
+            batch_size=256, shuffle=False,
+        )
         preds: list[np.ndarray] = []
         with torch.no_grad():
-            for xt, xs, _ in loader:
+            for xt, xs, _ in model_loader:
                 preds.append(model(xt.to(device), xs.to(device)).cpu().numpy())
         config_preds[name] = np.expm1(np.clip(np.concatenate(preds), 0, None))
 
