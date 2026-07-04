@@ -229,12 +229,19 @@ def build_policy_masks(out_dir: Path = PGS2S_DIR, holdout_frac: float = HOLDOUT_
     """Pair-disjoint 80/20 masks over val/cal rows (rng(42)); assert disjointness + full week coverage."""
     val_meta = np.load(SEQ_DIR / "val_meta.npy")
     cal_meta = np.load(SEQ_DIR / "cal_meta.npy")
+    # codex: D-009 relies on cal being the same row-addressing space as val
+    # before masks split pairs across the two views. If val_meta and cal_meta
+    # ever drift, this silently builds masks over different universes and the
+    # holdout diagnostics no longer test the intended pair-disjoint split.
 
     pairs = _pair_universe(val_meta)
     perm = np.random.default_rng(SEED).permutation(len(pairs))
     n_holdout = int(round(holdout_frac * len(pairs)))
     holdout_pairs = {pairs[i] for i in perm[:n_holdout]}
     train_pairs = {pairs[i] for i in perm[n_holdout:]}
+    # codex: US4-AS4/FR-9 treats pair overlap as a hard runtime abort; bare
+    # asserts are skipped under `python -O`, so this should be an explicit
+    # RuntimeError/ValueError before any training entry point relies on it.
     assert not (train_pairs & holdout_pairs), "policy pair sets overlap (US4-AS4)"
 
     train_mask = np.fromiter(
@@ -248,6 +255,9 @@ def build_policy_masks(out_dir: Path = PGS2S_DIR, holdout_frac: float = HOLDOUT_
     for mask, meta, view in ((train_mask, val_meta, "policy_train"),
                              (holdout_mask, cal_meta, "policy_holdout")):
         weeks = set(np.unique(meta[mask][:, 2]).astype(int))
+        # codex: Same concern as above: missing anchor-week coverage is a
+        # training gate, so it should not depend on assert statements being
+        # enabled in the interpreter.
         assert weeks == set(range(lo, hi + 1)), (
             f"[pgs2s] {view} view missing anchor weeks: {sorted(set(range(lo, hi + 1)) - weeks)}")
 
